@@ -1,5 +1,6 @@
 default_model = "closerouter/openai-gpt-6-astra"
 default_permission_mode = "auto"
+telemetry = false  # do not send usage telemetry to Moonshot (telemetry-logs.kimi.com)
 
 [providers.closerouter]
 type = "openai"
