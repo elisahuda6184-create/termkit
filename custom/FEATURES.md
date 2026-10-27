@@ -319,6 +319,33 @@ The feature was written on Kimi Code 2.2.0 and merged onto 2.3.1 with `git am --
 
 Tests: apps/kimi-code `test/tui/components/chrome/agent-dock.test.ts`, `test/tui/components/messages/agent-conversation.test.ts`, the `subscribe` case in `test/tui/controllers/subagent-activity-store.test.ts`.
 
+## 14. Muse subscription usage (`0014-…`)
+
+The muse provider (`[providers.muse]` in `config.toml`: `api_key_env = "MUSE_FORWARDER_KEY"`, base URL `https://<host>:8788/v1`) is a subscription, not a prepaid balance. The forwarder's `GET /usage` reports how much of the weekly quota and of the short rolling window (5 hours) is used, when each resets, the token counts and the request count. This feature shows that next to the dollar balances of features 2, 5 and 8 without touching them.
+
+- CLI: `/usage` adds a second panel, ` Muse `, under the usual one whenever the muse provider is configured (a provider with `api_key_env = "MUSE_FORWARDER_KEY"` and that variable set), whichever model is active. Heading `Muse usage · v<muse_version>`, two bars, `Weekly` and `5h window` (the label comes from `window_duration_mins`), each with `N% used` and `resets in …`, then a `tokens  in … out … cached … reasoning …  ·  N requests` line. When the forwarder cannot be read the panel says `Muse usage unavailable`; `/usage` never fails because of it.
+- Web: a pill `Muse  weekly 1% · 5h 3%` next to the balance badge before the model picker, only while the open session's model is served by the muse provider; otherwise nothing.
+
+The `/usage` reply looks like `{"identity":{"muse_version":"1.4.13-R6996.1",…},"requests":7,"subscription":{"weekly":{"resets_at":1793577600,"used_percent":1},"window":{"resets_at":1793124239,"used_percent":3,"window_duration_mins":300}},"tokens":{"cached":89296,"input":157438,"output":2780,"reasoning":1169}}`; `resets_at` are UNIX seconds.
+
+Code:
+
+- `apps/kimi-code/src/utils/billing/muse-usage.ts`: everything about the forwarder's `/usage`.
+  - `isMuseProvider()` recognises the provider by `apiKeyEnv === 'MUSE_FORWARDER_KEY'`; `museEndpoint()` and `configuredMuseEndpoint()` pair a base URL (a model's own, else the provider's) with the key from the environment (blank counts as unset).
+  - `museUsageUrl()`: `/usage` lives at the **root** of the host (`https://host:8788/usage`), not under `/v1`.
+  - `fetchMuseUsage()` GETs it with `Authorization: Bearer <key>` and a 5 second timeout and resolves `undefined` on any failure, like `BillingProvider.getJson()`. Node's fetch honours `NODE_EXTRA_CA_CERTS`, so the forwarder's certificate needs no extra handling.
+  - `parseMuseUsage()` turns the reply into `MuseUsage`: `used_percent / 100` → `usedRatio` (clamped to 0..1); `resets_at` → ISO string, because the panel's reset hint uses `Date.parse`; `windowLabel()` makes `5h window`, `45m window` or `1h 30m window` from `window_duration_mins`.
+  - `toQuotaRows()` feeds the existing bar renderer (`QuotaUsageRow`).
+  - It is deliberately not a `BillingProvider`: `ProviderBalance.usd` is a dollar amount, and both the footer and the web badge format dollars.
+- `apps/kimi-code/src/tui/components/messages/usage-panel.ts`: `buildManagedUsageSection()` takes an optional heading (default `Plan usage`); `buildMuseUsageReportLines()` reuses it for the Muse section and appends the tokens line.
+- `apps/kimi-code/src/tui/commands/info.ts`: `showUsage()` loads the muse usage next to the managed quota (`loadMuseUsageReport`) and adds the ` Muse ` `UsagePanelComponent` after the usual panel.
+- `apps/kimi-code/src/cli/sub/web/balance-badge.ts`: `registerMuseUsageRoute()` serves `GET /api/customkimi/muse-usage?model=<alias>` (bearer auth like every `/api` route) with `{ data: MuseUsage | null }`: null unless the alias, or without one the default model, resolves to the muse provider. Replies are cached per alias for 60 seconds, in-flight requests included. `BadgeConfig.providers` now also carries `apiKeyEnv`.
+- `apps/kimi-code/src/cli/sub/web/balance-badge-script.ts`: the browser script asks both routes on every refresh and renders the muse pill (`#customkimi-muse`) only when the reply's `data` is non-null, with the same placement and corner fallback as the balance badge.
+- `apps/kimi-code/src/cli/sub/web/run.ts`: registers the route next to `registerBalanceBadge`.
+- `apps/kimi-code/vitest.config.ts`: blanks `MUSE_FORWARDER_KEY` like the other provider keys.
+
+Tests (apps/kimi-code): `test/utils/billing/muse-usage.test.ts`, the `Muse usage panel` cases in `test/tui/components/messages/usage-panel.test.ts`, the `web muse usage route` cases in `test/cli/web/balance-badge.test.ts`.
+
 ## When a patch conflicts
 
 `update.sh` stops, leaves the new release in `source.next` with the patch half-applied, and keeps your current `kimi` running.

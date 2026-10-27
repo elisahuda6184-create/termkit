@@ -1,0 +1,1234 @@
+From 641bb5a850f896f861f1d114c206d6a9cd1fd9dc Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Tue, 27 Oct 2026 21:29:57 +0700
+Subject: [PATCH 14/14] customkimi: show the muse subscription's usage in
+ /usage and the web UI
+
+Adds a "Muse" section to the existing /usage command (shown whenever a
+muse provider is configured) and a usage pill in the kimi web UI shown
+only when the active model is a muse model. Reads the forwarder's
+GET /usage (weekly and rolling-window percentages, reset times, token
+totals) over the muse provider's base URL. Kept separate from the
+dollar-balance system; no other provider is affected.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ .../src/cli/sub/web/balance-badge-script.ts   |  86 +++++--
+ .../src/cli/sub/web/balance-badge.ts          |  67 ++++-
+ apps/kimi-code/src/cli/sub/web/run.ts         |   6 +-
+ apps/kimi-code/src/tui/commands/info.ts       |  39 ++-
+ .../tui/components/messages/usage-panel.ts    |  46 +++-
+ .../kimi-code/src/utils/billing/muse-usage.ts | 177 +++++++++++++
+ .../test/cli/web/balance-badge.test.ts        | 117 ++++++++-
+ .../components/messages/usage-panel.test.ts   | 130 +++++++++-
+ .../test/utils/billing/muse-usage.test.ts     | 236 ++++++++++++++++++
+ apps/kimi-code/vitest.config.ts               |   4 +-
+ 10 files changed, 871 insertions(+), 37 deletions(-)
+ create mode 100644 apps/kimi-code/src/utils/billing/muse-usage.ts
+ create mode 100644 apps/kimi-code/test/utils/billing/muse-usage.test.ts
+
+diff --git a/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts b/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts
+index 9d3d95f51caf8c0bec8ff263ef4715c64686fa69..03b4b2808885fc0de5b75f5d0a98270846aba235 100644
+--- a/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts
++++ b/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts
+@@ -1,20 +1,24 @@
+ /**
+- * Browser script for the web UI balance badge. It sits just before the model picker in
+- * the composer toolbar (`.mp-name`); if a web UI update moves the picker, it falls back
+- * to a small fixed pill in the bottom-right corner. It reads the web UI's own stored
+- * credential, asks the session API for the open session's model, refreshes every minute
+- * and whenever the session or model changes, and hides itself when no balance is known.
++ * Browser script for the web UI balance badge and the muse usage pill. They sit just before
++ * the model picker in the composer toolbar (`.mp-name`); if a web UI update moves the
++ * picker, they fall back to small fixed pills in the bottom-right corner. The script reads
++ * the web UI's own stored credential, asks the session API for the open session's model,
++ * refreshes every minute and whenever the session or model changes, and hides each pill
++ * when its route reports nothing (no balance; a model not served by the muse provider).
+  * A credential the server rejects is never retried, so the badge cannot trip the
+  * server's failed-auth rate limit.
+  */
+-export function balanceBadgeScript(apiPath: string): string {
++export function balanceBadgeScript(apiPath: string, museApiPath: string): string {
+   return `(function () {
+   'use strict';
+   var API = ${JSON.stringify(apiPath)};
++  var MUSE_API = ${JSON.stringify(museApiPath)};
+   var CREDENTIAL_KEY = 'kimi-web.server-credential';
+   var BADGE_ID = 'customkimi-balance';
++  var MUSE_ID = 'customkimi-muse';
+   var STYLE_ID = 'customkimi-balance-style';
+   var latest = null;
++  var muse = null;
+   var rejected = null;
+   var lastSessionId;
+   var lastModelText;
+@@ -54,10 +58,17 @@ export function balanceBadgeScript(apiPath: string): string {
+     });
+   }
+ 
++  function getData(url, token) {
++    return getJson(url, token)
++      .then(function (body) { return body && body.data ? body.data : null; })
++      .catch(function () { return null; });
++  }
++
+   function refresh() {
+     var token = credential() || '';
+     if (token === rejected) {
+       latest = null;
++      muse = null;
+       render();
+       return;
+     }
+@@ -69,11 +80,12 @@ export function balanceBadgeScript(apiPath: string): string {
+       : Promise.resolve(null);
+     model
+       .then(function (alias) {
+-        if (token === rejected) return null;
+-        return getJson(alias ? API + '?model=' + encodeURIComponent(alias) : API, token);
++        if (token === rejected) return [null, null];
++        var query = alias ? '?model=' + encodeURIComponent(alias) : '';
++        return Promise.all([getData(API + query, token), getData(MUSE_API + query, token)]);
+       })
+-      .then(function (body) { latest = body && body.data ? body.data : null; render(); })
+-      .catch(function () { latest = null; render(); });
++      .then(function (data) { latest = data[0]; muse = data[1]; render(); })
++      .catch(function () { latest = null; muse = null; render(); });
+   }
+ 
+   function ensureStyle() {
+@@ -81,37 +93,67 @@ export function balanceBadgeScript(apiPath: string): string {
+     var style = document.createElement('style');
+     style.id = STYLE_ID;
+     style.textContent =
+-      '#' + BADGE_ID + '{font-size:13px;opacity:.6;white-space:nowrap;margin-right:12px;align-self:center}' +
+-      '#' + BADGE_ID + '.ck-floating{position:fixed;right:16px;bottom:12px;margin:0;padding:3px 10px;' +
+-      'border-radius:999px;background:rgba(127,127,127,.15);opacity:.85;z-index:2147483647}';
++      '#' + BADGE_ID + ',#' + MUSE_ID + '{font-size:13px;opacity:.6;white-space:nowrap;margin-right:12px;align-self:center}' +
++      '#' + MUSE_ID + '{white-space:pre}' +
++      '#' + BADGE_ID + '.ck-floating,#' + MUSE_ID + '.ck-floating{position:fixed;right:16px;bottom:12px;margin:0;padding:3px 10px;' +
++      'border-radius:999px;background:rgba(127,127,127,.15);opacity:.85;z-index:2147483647}' +
++      '#' + MUSE_ID + '.ck-floating{bottom:40px}';
+     document.head.appendChild(style);
+   }
+ 
+-  function render() {
+-    var badge = document.getElementById(BADGE_ID);
+-    if (!latest || typeof latest.usd !== 'number') {
++  function pill(id, show) {
++    var badge = document.getElementById(id);
++    if (!show) {
+       if (badge) badge.remove();
+-      return;
++      return null;
+     }
+     ensureStyle();
+     if (!badge) {
+       badge = document.createElement('span');
+-      badge.id = BADGE_ID;
++      badge.id = id;
+     }
+-    var text = latest.label + ' $' + latest.usd.toFixed(2);
+-    if (badge.textContent !== text) badge.textContent = text;
+-    badge.title = latest.label + ' account balance';
++    return badge;
++  }
++
++  function place(badge, before) {
+     var picker = document.querySelector('.mp-name');
+     var anchor = picker ? picker.closest('button') || picker : null;
+     if (anchor && anchor.parentElement) {
+       badge.classList.remove('ck-floating');
+-      if (badge.nextElementSibling !== anchor) anchor.parentElement.insertBefore(badge, anchor);
++      var next = before && before.parentElement === anchor.parentElement ? before : anchor;
++      if (badge.nextElementSibling !== next) anchor.parentElement.insertBefore(badge, next);
+     } else {
+       badge.classList.add('ck-floating');
+       if (badge.parentElement !== document.body) document.body.appendChild(badge);
+     }
+   }
+ 
++  function percent(quota) {
++    return Math.round(quota.usedRatio * 100) + '%';
++  }
++
++  function render() {
++    var museBadge = pill(
++      MUSE_ID,
++      muse && muse.weekly && muse.window &&
++        typeof muse.weekly.usedRatio === 'number' && typeof muse.window.usedRatio === 'number',
++    );
++    var badge = pill(BADGE_ID, latest && typeof latest.usd === 'number');
++    if (badge) {
++      var text = latest.label + ' $' + latest.usd.toFixed(2);
++      if (badge.textContent !== text) badge.textContent = text;
++      badge.title = latest.label + ' account balance';
++      place(badge, museBadge);
++    }
++    if (museBadge) {
++      var short = typeof muse.windowLabel === 'string' ? muse.windowLabel.replace(/ window$/, '') : 'window';
++      var museText = 'Muse  weekly ' + percent(muse.weekly) + ' · ' + short + ' ' + percent(muse.window);
++      if (museBadge.textContent !== museText) museBadge.textContent = museText;
++      museBadge.title = 'Muse subscription usage' + (muse.version ? ' (muse ' + muse.version + ')' : '');
++      place(museBadge, null);
++    }
++  }
++
+   function onChange() {
+     if (scheduled) return;
+     scheduled = true;
+diff --git a/apps/kimi-code/src/cli/sub/web/balance-badge.ts b/apps/kimi-code/src/cli/sub/web/balance-badge.ts
+index ff0897f1c051da698153a20eb663585c1738909f..10c9b747c25de8689fb88d840aed621a47647cce 100644
+--- a/apps/kimi-code/src/cli/sub/web/balance-badge.ts
++++ b/apps/kimi-code/src/cli/sub/web/balance-badge.ts
+@@ -6,19 +6,36 @@ import {
+ } from '@moonshot-ai/kimi-code-sdk';
+ 
+ import { modelResolver, type BillingSource } from '#/utils/billing/billing-monitor';
+-import { asRecord } from '#/utils/billing/billing-provider';
++import { asRecord, type BillingEnv } from '#/utils/billing/billing-provider';
++import { fetchMuseUsage, museEndpoint, type MuseUsage } from '#/utils/billing/muse-usage';
+ 
+ import { balanceBadgeScript } from './balance-badge-script';
+ 
+ export const BALANCE_API_PATH = '/api/customkimi/balance';
++export const MUSE_USAGE_API_PATH = '/api/customkimi/muse-usage';
+ export const BALANCE_BADGE_SCRIPT_PATH = '/customkimi/balance-badge.js';
+ export const BALANCE_BADGE_HTML = `<script src="${BALANCE_BADGE_SCRIPT_PATH}" defer></script>`;
+ 
++const MUSE_USAGE_CACHE_MS = 60_000;
++
+ /** The parts of the configuration the badge needs. */
+ export interface BadgeConfig {
+   readonly defaultModel?: string | undefined;
+   readonly models: Readonly<Record<string, Pick<ModelAlias, 'provider' | 'model' | 'baseUrl'>>>;
+-  readonly providers: Readonly<Record<string, Pick<ProviderConfig, 'baseUrl'>>>;
++  readonly providers: Readonly<Record<string, Pick<ProviderConfig, 'baseUrl' | 'apiKeyEnv'>>>;
++}
++
++export interface MuseUsageRouteOptions {
++  readonly loadConfig?: () => BadgeConfig;
++  /** Reads the forwarder's usage; resolves undefined on any failure. */
++  readonly fetchUsage?: (baseUrl: string, key: string) => Promise<MuseUsage | undefined>;
++  readonly env?: BillingEnv;
++  readonly now?: () => number;
++}
++
++interface CachedMuseUsage {
++  readonly expiresAt: number;
++  readonly usage: Promise<MuseUsage | undefined>;
+ }
+ 
+ interface BadgeReply {
+@@ -39,6 +56,12 @@ function loadBadgeConfig(): BadgeConfig {
+   return { defaultModel: config.defaultModel, models: config.models ?? {}, providers: config.providers ?? {} };
+ }
+ 
++/** The alias a badge route was asked about: `?model=<alias>`, else the default model. */
++function requestedModel(query: unknown, config: BadgeConfig): string | undefined {
++  const requested = asRecord(query)?.['model'];
++  return typeof requested === 'string' && requested !== '' ? requested : config.defaultModel;
++}
++
+ /**
+  * Adds the web UI balance badge: its script, served next to the web assets, and an API
+  * route (behind the server's bearer auth, like every /api route) returning the balance of
+@@ -51,15 +74,14 @@ export function registerBalanceBadge(
+   billing: BillingSource,
+   loadConfig: () => BadgeConfig = loadBadgeConfig,
+ ): void {
+-  const script = balanceBadgeScript(BALANCE_API_PATH);
++  const script = balanceBadgeScript(BALANCE_API_PATH, MUSE_USAGE_API_PATH);
+   app.get(BALANCE_BADGE_SCRIPT_PATH, async (_req, reply) =>
+     reply.type('text/javascript; charset=utf-8').send(script),
+   );
+ 
+   app.get(BALANCE_API_PATH, async (req, reply) => {
+     const config = loadConfig();
+-    const requested = asRecord(req.query)?.['model'];
+-    const alias = typeof requested === 'string' && requested !== '' ? requested : config.defaultModel;
++    const alias = requestedModel(req.query, config);
+     const endpoint = alias === undefined ? undefined : modelResolver(config.models, config.providers)(alias);
+     const balance = billing.balanceFor(endpoint?.baseUrl);
+     return reply
+@@ -67,3 +89,38 @@ export function registerBalanceBadge(
+       .send({ code: 0, msg: 'success', data: balance ?? null });
+   });
+ }
++
++/**
++ * Adds `GET /api/customkimi/muse-usage?model=<alias>` (bearer auth like every /api route):
++ * the muse subscription's usage when the alias, or without one the default model, is served
++ * by the muse provider, else null. Replies are cached per alias for a minute, in-flight
++ * requests included, so the browser's refreshes do not all reach the forwarder.
++ */
++export function registerMuseUsageRoute(app: BadgeRouteHost, options: MuseUsageRouteOptions = {}): void {
++  const loadConfig = options.loadConfig ?? loadBadgeConfig;
++  const fetchUsage = options.fetchUsage ?? fetchMuseUsage;
++  const env = options.env ?? process.env;
++  const now = options.now ?? Date.now;
++  const cache = new Map<string, CachedMuseUsage>();
++
++  const usageFor = (config: BadgeConfig, alias: string): Promise<MuseUsage | undefined> => {
++    const model = config.models[alias];
++    const endpoint =
++      model === undefined ? undefined : museEndpoint(config.providers[model.provider], model.baseUrl, env);
++    if (endpoint === undefined) return Promise.resolve(undefined);
++    const cached = cache.get(alias);
++    if (cached !== undefined && cached.expiresAt > now()) return cached.usage;
++    const usage = fetchUsage(endpoint.baseUrl, endpoint.key);
++    cache.set(alias, { expiresAt: now() + MUSE_USAGE_CACHE_MS, usage });
++    return usage;
++  };
++
++  app.get(MUSE_USAGE_API_PATH, async (req, reply) => {
++    const config = loadConfig();
++    const alias = requestedModel(req.query, config);
++    const usage = alias === undefined ? undefined : await usageFor(config, alias);
++    return reply
++      .type('application/json; charset=utf-8')
++      .send({ code: 0, msg: 'success', data: usage ?? null });
++  });
++}
+diff --git a/apps/kimi-code/src/cli/sub/web/run.ts b/apps/kimi-code/src/cli/sub/web/run.ts
+index fca3f9b8fb72e130faf1f6a5ca766bfb1f173b8e..55ed50c6d0b825febce3869905ab9f88e35283d4 100644
+--- a/apps/kimi-code/src/cli/sub/web/run.ts
++++ b/apps/kimi-code/src/cli/sub/web/run.ts
+@@ -27,7 +27,7 @@ import { BillingMonitor } from '#/utils/billing/billing-monitor';
+ import { createBillingProviders } from '#/utils/billing/providers';
+ 
+ import { initializeServerTelemetry } from '../../telemetry';
+-import { BALANCE_BADGE_HTML, registerBalanceBadge } from './balance-badge';
++import { BALANCE_BADGE_HTML, registerBalanceBadge, registerMuseUsageRoute } from './balance-badge';
+ import {
+   createKimiCodeHostIdentity,
+   getHostPackageRoot,
+@@ -408,10 +408,12 @@ async function runServerInProcess(
+     // only covers host-level events.
+     telemetry: true,
+     webAssetsDir,
+-    // CustomKIMI: the provider balance badge next to the web UI's model picker.
++    // CustomKIMI: the provider balance badge and the muse usage pill next to the web UI's
++    // model picker.
+     webHtmlInjection: BALANCE_BADGE_HTML,
+     extraRoutes: (app) => {
+       registerBalanceBadge(app, billing);
++      registerMuseUsageRoute(app);
+     },
+   });
+   logger.info('serving the REST/WS API and the bundled web UI');
+diff --git a/apps/kimi-code/src/tui/commands/info.ts b/apps/kimi-code/src/tui/commands/info.ts
+index f8bdc0635963e30a50a08764f7224fafe256ff1c..8122b046678395ef515070cc6ded8cdc20aaca88 100644
+--- a/apps/kimi-code/src/tui/commands/info.ts
++++ b/apps/kimi-code/src/tui/commands/info.ts
+@@ -4,8 +4,14 @@ import type { McpServerInfo, SessionStatus, SessionUsage } from '@moonshot-ai/ki
+ 
+ import { buildMcpStatusReportLines } from '../components/messages/mcp-status-panel';
+ import { buildStatusReportLines } from '../components/messages/status-panel';
+-import { buildUsageReportLines, UsagePanelComponent, type ManagedUsageReport } from '../components/messages/usage-panel';
++import {
++  buildMuseUsageReportLines,
++  buildUsageReportLines,
++  UsagePanelComponent,
++  type ManagedUsageReport,
++} from '../components/messages/usage-panel';
+ import { isExperimentalFlagEnabled } from './experimental-flags';
++import { configuredMuseEndpoint, fetchMuseUsage, type MuseUsage } from '#/utils/billing/muse-usage';
+ import { quotaUsageRows } from '#/utils/usage/usage-format';
+ import {
+   FEEDBACK_ISSUE_URL,
+@@ -146,9 +152,19 @@ interface ManagedUsageResult {
+   readonly error?: string;
+ }
+ 
++interface MuseUsageResult {
++  readonly usage?: MuseUsage;
++  readonly error?: string;
++}
++
++const MUSE_USAGE_UNAVAILABLE = 'Muse usage unavailable';
++
+ export async function showUsage(host: SlashCommandHost): Promise<void> {
+   const sessionUsage = await loadSessionUsageReport(host);
+-  const managedUsage = await loadManagedUsageReport(host);
++  const [managedUsage, museUsage] = await Promise.all([
++    loadManagedUsageReport(host),
++    loadMuseUsageReport(host),
++  ]);
+   const reportArgs = {
+     sessionUsage: sessionUsage.usage,
+     sessionUsageError: sessionUsage.error,
+@@ -160,6 +176,12 @@ export async function showUsage(host: SlashCommandHost): Promise<void> {
+   };
+   const panel = new UsagePanelComponent(() => buildUsageReportLines(reportArgs), 'primary');
+   host.state.transcriptContainer.addChild(panel);
++  if (museUsage !== undefined) {
++    const museArgs = { museUsage: museUsage.usage, museUsageError: museUsage.error };
++    host.state.transcriptContainer.addChild(
++      new UsagePanelComponent(() => buildMuseUsageReportLines(museArgs), 'primary', ' Muse '),
++    );
++  }
+   host.state.ui.requestRender();
+ }
+ 
+@@ -253,3 +275,16 @@ async function loadManagedUsageReport(host: SlashCommandHost): Promise<ManagedUs
+   }
+   return { usage: { rows: quotaUsageRows(res.quota), extraUsage: res.quota.extraUsage } };
+ }
++
++/**
++ * CustomKIMI: the muse subscription's quotas, read from the forwarder whenever the muse
++ * provider is configured, whichever model is active. Undefined when it is not configured.
++ * `/usage` is dispatched fire-and-forget, so this never throws: `fetchMuseUsage` resolves
++ * undefined on every failure, which the panel shows as "Muse usage unavailable".
++ */
++async function loadMuseUsageReport(host: SlashCommandHost): Promise<MuseUsageResult | undefined> {
++  const endpoint = configuredMuseEndpoint(host.state.appState.availableProviders);
++  if (endpoint === undefined) return undefined;
++  const usage = await fetchMuseUsage(endpoint.baseUrl, endpoint.key);
++  return usage === undefined ? { error: MUSE_USAGE_UNAVAILABLE } : { usage };
++}
+diff --git a/apps/kimi-code/src/tui/components/messages/usage-panel.ts b/apps/kimi-code/src/tui/components/messages/usage-panel.ts
+index 1b615ac569e52301321a1b941b756e7cb9d91349..46d49b8e588b8f9bb1f52aa29661f75c61ca467d 100644
+--- a/apps/kimi-code/src/tui/components/messages/usage-panel.ts
++++ b/apps/kimi-code/src/tui/components/messages/usage-panel.ts
+@@ -17,6 +17,7 @@ import {
+   usagePercent,
+   type QuotaUsageRow,
+ } from '#/utils/usage/usage-format';
++import { toQuotaRows, type MuseUsage } from '#/utils/billing/muse-usage';
+ import { currentTheme } from '#/tui/theme';
+ import type { ColorToken } from '#/tui/theme';
+ 
+@@ -65,6 +66,11 @@ export interface ManagedUsageReportLineOptions {
+   readonly managedUsageError?: string;
+ }
+ 
++export interface MuseUsageReportLineOptions {
++  readonly museUsage?: MuseUsage;
++  readonly museUsageError?: string;
++}
++
+ function usageNumber(value: unknown): number {
+   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+ }
+@@ -120,12 +126,13 @@ function buildManagedUsageSection(
+   value: Colorize,
+   muted: Colorize,
+   errorStyle: Colorize,
++  heading = 'Plan usage',
+ ): string[] {
+-  if (error !== undefined) return [accent('Plan usage'), errorStyle(`  ${error}`)];
++  if (error !== undefined) return [accent(heading), errorStyle(`  ${error}`)];
+   if (usage === undefined) return [];
+   const { rows } = usage;
+   if (rows.length === 0) {
+-    return [accent('Plan usage'), muted('  No usage data available.')];
++    return [accent(heading), muted('  No usage data available.')];
+   }
+ 
+   const labels = rows.map((r) => r.name);
+@@ -133,7 +140,7 @@ function buildManagedUsageSection(
+   const rowRatio = (r: QuotaUsageRow): number => safeUsageRatio(r.usedRatio);
+   const pctWidth = Math.max(...rows.map((r) => `${Math.round(rowRatio(r) * 100)}% used`.length));
+ 
+-  const out: string[] = [accent('Plan usage')];
++  const out: string[] = [accent(heading)];
+   for (let i = 0; i < rows.length; i++) {
+     const row = rows[i]!;
+     const ratioUsed = rowRatio(row);
+@@ -255,6 +262,39 @@ export function buildManagedUsageReportLines(options: ManagedUsageReportLineOpti
+   );
+ }
+ 
++/**
++ * The `/usage` Muse panel: the subscription's two quotas as bars under a heading that
++ * carries the muse version, then the token counts and the request count.
++ */
++export function buildMuseUsageReportLines(options: MuseUsageReportLineOptions): string[] {
++  const accent = (text: string) => currentTheme.boldFg('primary', text);
++  const value = (text: string) => currentTheme.fg('text', text);
++  const muted = (text: string) => currentTheme.fg('textDim', text);
++  const errorStyle = (text: string) => currentTheme.fg('error', text);
++
++  const usage = options.museUsage;
++  const heading = usage?.version === undefined ? 'Muse usage' : `Muse usage · v${usage.version}`;
++  const lines = buildManagedUsageSection(
++    usage === undefined ? undefined : { rows: toQuotaRows(usage) },
++    options.museUsageError,
++    accent,
++    value,
++    muted,
++    errorStyle,
++    heading,
++  );
++  if (usage === undefined) return lines;
++
++  const { tokens } = usage;
++  const counts =
++    `in ${value(formatTokenCount(tokens.input))}  out ${value(formatTokenCount(tokens.output))}  ` +
++    `cached ${value(formatTokenCount(tokens.cached))}  reasoning ${value(formatTokenCount(tokens.reasoning))}`;
++  const requests =
++    usage.requests === undefined ? '' : `  ·  ${value(String(usage.requests))} ${muted('requests')}`;
++  lines.push(`  ${muted('tokens')}  ${counts}${requests}`);
++  return lines;
++}
++
+ export function buildUsageReportLines(options: UsageReportOptions): string[] {
+   const accent = (text: string) => currentTheme.boldFg('primary', text);
+   const value = (text: string) => currentTheme.fg('text', text);
+diff --git a/apps/kimi-code/src/utils/billing/muse-usage.ts b/apps/kimi-code/src/utils/billing/muse-usage.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c7e1f881cf94eb85cb0bb27dcd2688f2f1c471f
+--- /dev/null
++++ b/apps/kimi-code/src/utils/billing/muse-usage.ts
+@@ -0,0 +1,177 @@
++import type { QuotaUsageRow } from '#/utils/usage/usage-format';
++
++import { asRecord, toFiniteNumber, type BillingEnv, type Fetcher } from './billing-provider';
++
++/** The environment variable a provider reads its key from when it is the muse forwarder. */
++export const MUSE_API_KEY_ENV = 'MUSE_FORWARDER_KEY';
++
++const REQUEST_TIMEOUT_MS = 5_000;
++
++/** One subscription quota: the share used and when it resets (ISO 8601). */
++export interface MuseWindow {
++  readonly usedRatio: number;
++  readonly resetAt?: string;
++}
++
++export interface MuseTokens {
++  readonly input: number;
++  readonly output: number;
++  readonly cached: number;
++  readonly reasoning: number;
++}
++
++/** What the forwarder's GET /usage reports about the muse subscription. */
++export interface MuseUsage {
++  readonly weekly: MuseWindow;
++  /** The short rolling window; `windowLabel` names its length ("5h window"). */
++  readonly window: MuseWindow;
++  readonly windowLabel: string;
++  readonly version?: string;
++  readonly tokens: MuseTokens;
++  readonly requests?: number;
++}
++
++/** Where the usage is read from, and with which key. */
++export interface MuseEndpoint {
++  readonly baseUrl: string;
++  readonly key: string;
++}
++
++/** The parts of a provider's configuration the usage lookup reads. */
++export interface MuseProviderConfig {
++  readonly type?: string;
++  readonly baseUrl?: string;
++  readonly apiKeyEnv?: string;
++}
++
++/**
++ * The muse forwarder is a subscription, not a prepaid balance, so it is not a
++ * `BillingProvider`: both renderers of `ProviderBalance` format dollars. It is recognised by
++ * the key variable its provider entry names.
++ */
++export function isMuseProvider(provider: MuseProviderConfig | undefined): boolean {
++  return provider?.apiKeyEnv === MUSE_API_KEY_ENV;
++}
++
++/** The forwarder's usage endpoint: /usage lives at the root of the host, next to /v1. */
++export function museUsageUrl(baseUrl: string): string {
++  return `${new URL(baseUrl).origin}/usage`;
++}
++
++/**
++ * The forwarder's endpoint for `provider`, read at `baseUrl` (a model's own base URL, else
++ * the provider's), or undefined when the provider is not the muse forwarder, has no base
++ * URL, or its key is not set (blank counts as unset).
++ */
++export function museEndpoint(
++  provider: MuseProviderConfig | undefined,
++  baseUrl: string | undefined = provider?.baseUrl,
++  env: BillingEnv = process.env,
++): MuseEndpoint | undefined {
++  if (!isMuseProvider(provider)) return undefined;
++  const key = env[MUSE_API_KEY_ENV]?.trim();
++  return baseUrl === undefined || key === undefined || key === '' ? undefined : { baseUrl, key };
++}
++
++/** The endpoint of the muse provider among `providers`, whichever model is active. */
++export function configuredMuseEndpoint(
++  providers: Readonly<Record<string, MuseProviderConfig>>,
++  env: BillingEnv = process.env,
++): MuseEndpoint | undefined {
++  for (const provider of Object.values(providers)) {
++    const endpoint = museEndpoint(provider, provider.baseUrl, env);
++    if (endpoint !== undefined) return endpoint;
++  }
++  return undefined;
++}
++
++/** "5h window", "45m window" or "1h 30m window" from the window's length; "Window" without one. */
++export function windowLabel(minutes: number | undefined): string {
++  const whole = minutes === undefined || !Number.isFinite(minutes) ? 0 : Math.round(minutes);
++  if (whole <= 0) return 'Window';
++  const hours = Math.floor(whole / 60);
++  const rest = whole % 60;
++  if (hours === 0) return `${String(rest)}m window`;
++  return rest === 0 ? `${String(hours)}h window` : `${String(hours)}h ${String(rest)}m window`;
++}
++
++/**
++ * The usage from the forwarder's reply, or undefined unless both quotas carry a numeric
++ * `used_percent`. Percentages become 0..1 ratios; `resets_at` (UNIX seconds) becomes an ISO
++ * string, which is what the usage panel's reset hint parses.
++ */
++export function parseMuseUsage(json: unknown): MuseUsage | undefined {
++  const reply = asRecord(json);
++  const subscription = asRecord(reply?.['subscription']);
++  const weekly = parseWindow(subscription?.['weekly']);
++  const window = asRecord(subscription?.['window']);
++  const windowQuota = parseWindow(window);
++  if (weekly === undefined || windowQuota === undefined) return undefined;
++  const tokens = asRecord(reply?.['tokens']);
++  const version = asRecord(reply?.['identity'])?.['muse_version'];
++  return {
++    weekly,
++    window: windowQuota,
++    windowLabel: windowLabel(toFiniteNumber(window?.['window_duration_mins'])),
++    version: typeof version === 'string' && version !== '' ? version : undefined,
++    tokens: {
++      input: tokenCount(tokens?.['input']),
++      output: tokenCount(tokens?.['output']),
++      cached: tokenCount(tokens?.['cached']),
++      reasoning: tokenCount(tokens?.['reasoning']),
++    },
++    requests: toFiniteNumber(reply?.['requests']),
++  };
++}
++
++function parseWindow(value: unknown): MuseWindow | undefined {
++  const quota = asRecord(value);
++  const percent = toFiniteNumber(quota?.['used_percent']);
++  if (percent === undefined) return undefined;
++  return {
++    usedRatio: Math.max(0, Math.min(percent / 100, 1)),
++    resetAt: isoFromUnixSeconds(quota?.['resets_at']),
++  };
++}
++
++function isoFromUnixSeconds(value: unknown): string | undefined {
++  const seconds = toFiniteNumber(value);
++  if (seconds === undefined) return undefined;
++  const date = new Date(seconds * 1000);
++  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
++}
++
++function tokenCount(value: unknown): number {
++  const count = toFiniteNumber(value);
++  return count === undefined || count < 0 ? 0 : count;
++}
++
++/**
++ * GETs the forwarder's /usage with the key as a bearer token; resolves undefined without a
++ * key and on any failure, like `BillingProvider.getJson()`. Node's fetch honours
++ * NODE_EXTRA_CA_CERTS, so the forwarder's certificate needs no handling here.
++ */
++export async function fetchMuseUsage(
++  baseUrl: string,
++  key: string | undefined,
++  fetcher: Fetcher = globalThis.fetch,
++): Promise<MuseUsage | undefined> {
++  if (key === undefined) return undefined;
++  try {
++    const response = await fetcher(museUsageUrl(baseUrl), {
++      headers: { Authorization: `Bearer ${key}` },
++      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
++    });
++    return response.ok ? parseMuseUsage(await response.json()) : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++/** The two quotas as rows of the usage panel's bar renderer. */
++export function toQuotaRows(usage: MuseUsage): QuotaUsageRow[] {
++  return [
++    { name: 'Weekly', usedRatio: usage.weekly.usedRatio, resetAt: usage.weekly.resetAt },
++    { name: usage.windowLabel, usedRatio: usage.window.usedRatio, resetAt: usage.window.resetAt },
++  ];
++}
+diff --git a/apps/kimi-code/test/cli/web/balance-badge.test.ts b/apps/kimi-code/test/cli/web/balance-badge.test.ts
+index a15ddc2b473c5c43247da33cf7ff6a106440195c..d09c1cb7babfee04af34bb671f2070e1be9954b5 100644
+--- a/apps/kimi-code/test/cli/web/balance-badge.test.ts
++++ b/apps/kimi-code/test/cli/web/balance-badge.test.ts
+@@ -1,14 +1,18 @@
+-import { describe, expect, it } from 'vitest';
++import { describe, expect, it, vi } from 'vitest';
+ 
+ import {
+   BALANCE_API_PATH,
+   BALANCE_BADGE_HTML,
+   BALANCE_BADGE_SCRIPT_PATH,
++  MUSE_USAGE_API_PATH,
+   registerBalanceBadge,
++  registerMuseUsageRoute,
+   type BadgeConfig,
+   type BadgeRouteHost,
++  type MuseUsageRouteOptions,
+ } from '#/cli/sub/web/balance-badge';
+ import type { BillingSource } from '#/utils/billing/billing-monitor';
++import type { MuseUsage } from '#/utils/billing/muse-usage';
+ 
+ type Handler = Parameters<BadgeRouteHost['get']>[1];
+ 
+@@ -18,11 +22,14 @@ const config: BadgeConfig = {
+     '7api/gpt-6-astra': { provider: '7api-responses', model: 'gpt-6-astra' },
+     'closerouter/openai-gpt-6-astra': { provider: 'closerouter', model: 'openai/gpt-6-astra' },
+     'other/model': { provider: 'other', model: 'model' },
++    'muse/wonder-1.0': { provider: 'muse', model: 'muse-wonder-1.0' },
++    'muse/mirror': { provider: 'muse', model: 'muse-wonder-1.0', baseUrl: 'https://mirror.example.test/v1' },
+   },
+   providers: {
+     '7api-responses': { baseUrl: 'https://7api.st/v1' },
+     closerouter: { baseUrl: 'https://api.closerouter.dev/v1' },
+     other: { baseUrl: 'https://other.example/v1' },
++    muse: { baseUrl: 'https://muse.example.test:8788/v1', apiKeyEnv: 'MUSE_FORWARDER_KEY' },
+   },
+ };
+ 
+@@ -92,8 +99,116 @@ describe('web balance badge route', () => {
+ 
+     expect(reply.contentType).toBe('text/javascript; charset=utf-8');
+     expect(reply.payload).toContain(BALANCE_API_PATH);
++    expect(reply.payload).toContain(MUSE_USAGE_API_PATH);
+     expect(reply.payload).toContain('/api/v1/sessions/');
+     expect(reply.payload).toContain('kimi-web.server-credential');
+     expect(BALANCE_BADGE_HTML).toBe(`<script src="${BALANCE_BADGE_SCRIPT_PATH}" defer></script>`);
+   });
+ });
++
++describe('web muse usage route', () => {
++  const usage: MuseUsage = {
++    weekly: { usedRatio: 0.01, resetAt: '2026-11-02T00:00:00.000Z' },
++    window: { usedRatio: 0.03, resetAt: '2026-10-27T18:03:59.000Z' },
++    windowLabel: '5h window',
++    version: '1.4.13-R6996.1',
++    tokens: { input: 157438, output: 2780, cached: 89296, reasoning: 1169 },
++    requests: 7,
++  };
++  const env = { MUSE_FORWARDER_KEY: 'muse-key' };
++
++  function museRoute(options: MuseUsageRouteOptions = {}) {
++    const fetchUsage = vi.fn(async () => usage);
++    let handler: Handler | undefined;
++    registerMuseUsageRoute(
++      { get: (path, h) => (path === MUSE_USAGE_API_PATH ? (handler = h) : undefined) },
++      { loadConfig: () => config, fetchUsage, env, ...options },
++    );
++    const call = async (query: unknown) => {
++      const reply = {
++        contentType: '',
++        payload: undefined as unknown,
++        type(contentType: string) {
++          this.contentType = contentType;
++          return this;
++        },
++        send(payload: unknown) {
++          this.payload = payload;
++          return this;
++        },
++      };
++      await handler?.({ query }, reply);
++      return reply;
++    };
++    return { call, fetchUsage };
++  }
++
++  it('returns the usage of the muse provider serving the requested model', async () => {
++    const { call, fetchUsage } = museRoute();
++    const reply = await call({ model: 'muse/wonder-1.0' });
++
++    expect(reply.contentType).toBe('application/json; charset=utf-8');
++    expect(reply.payload).toEqual({ code: 0, msg: 'success', data: usage });
++    expect(fetchUsage).toHaveBeenCalledWith('https://muse.example.test:8788/v1', 'muse-key');
++  });
++
++  it("reads the usage from the model's own base URL when it has one", async () => {
++    const { call, fetchUsage } = museRoute();
++    await call({ model: 'muse/mirror' });
++
++    expect(fetchUsage).toHaveBeenCalledWith('https://mirror.example.test/v1', 'muse-key');
++  });
++
++  it('returns null for models of other providers, unknown models and the default model', async () => {
++    const { call, fetchUsage } = museRoute();
++    const nothing = { code: 0, msg: 'success', data: null };
++
++    expect((await call({ model: '7api/gpt-6-astra' })).payload).toEqual(nothing);
++    expect((await call({ model: 'unknown/model' })).payload).toEqual(nothing);
++    expect((await call({})).payload).toEqual(nothing);
++    expect(fetchUsage).not.toHaveBeenCalled();
++  });
++
++  it('returns null without the key and when the forwarder cannot be read', async () => {
++    const nothing = { code: 0, msg: 'success', data: null };
++    const noKey = museRoute({ env: {} });
++    expect((await noKey.call({ model: 'muse/wonder-1.0' })).payload).toEqual(nothing);
++    expect(noKey.fetchUsage).not.toHaveBeenCalled();
++
++    const down = museRoute({ fetchUsage: vi.fn(async () => undefined) });
++    expect((await down.call({ model: 'muse/wonder-1.0' })).payload).toEqual(nothing);
++  });
++
++  it('caches the usage per model for a minute', async () => {
++    let now = 1_000_000;
++    const { call, fetchUsage } = museRoute({ now: () => now });
++
++    await call({ model: 'muse/wonder-1.0' });
++    now += 30_000;
++    await call({ model: 'muse/wonder-1.0' });
++    expect(fetchUsage).toHaveBeenCalledTimes(1);
++
++    await call({ model: 'muse/mirror' });
++    expect(fetchUsage).toHaveBeenCalledTimes(2);
++
++    now += 31_000;
++    await call({ model: 'muse/wonder-1.0' });
++    expect(fetchUsage).toHaveBeenCalledTimes(3);
++  });
++
++  it('shares one request between callers that arrive while it is in flight', async () => {
++    let resolveUsage: (value: MuseUsage | undefined) => void = () => {};
++    const pending = new Promise<MuseUsage | undefined>((resolve) => {
++      resolveUsage = resolve;
++    });
++    const fetchUsage = vi.fn(() => pending);
++    const { call } = museRoute({ fetchUsage });
++
++    const first = call({ model: 'muse/wonder-1.0' });
++    const second = call({ model: 'muse/wonder-1.0' });
++    resolveUsage(usage);
++    expect((await first).payload).toEqual({ code: 0, msg: 'success', data: usage });
++    expect((await second).payload).toEqual({ code: 0, msg: 'success', data: usage });
++    expect(fetchUsage).toHaveBeenCalledTimes(1);
++  });
++});
+diff --git a/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts b/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
+index d46b78e061469503b27ebeaef7703e253a255d18..8122f8a8790aa5b8faa4f96a9770ad5031e7b61f 100644
+--- a/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
++++ b/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
+@@ -1,7 +1,11 @@
+ import { visibleWidth } from '@moonshot-ai/pi-tui';
+ import { afterEach, describe, expect, it, vi } from 'vitest';
+ 
+-import { buildUsageReportLines, UsagePanelComponent } from '#/tui/components/messages/usage-panel';
++import {
++  buildMuseUsageReportLines,
++  buildUsageReportLines,
++  UsagePanelComponent,
++} from '#/tui/components/messages/usage-panel';
+ import { currentTheme, darkColors, lightColors } from '#/tui/theme';
+ 
+ afterEach(() => {
+@@ -244,6 +248,7 @@ describe('UsagePanelComponent', () => {
+         appState: {
+           model: 'kimi',
+           availableModels: {},
++          availableProviders: {},
+           contextUsage: 0,
+           contextTokens: 0,
+           maxContextTokens: 1_000_000,
+@@ -310,3 +315,126 @@ describe('UsagePanelComponent', () => {
+     expect(bodyOf()).toContain(lightColors.text);
+   });
+ });
++
++describe('Muse usage panel', () => {
++  const museUsage = {
++    weekly: { usedRatio: 0.01, resetAt: '2026-11-02T00:00:00.000Z' },
++    window: { usedRatio: 0.03, resetAt: '2026-10-27T18:03:59.000Z' },
++    windowLabel: '5h window',
++    version: '1.4.13-R6996.1',
++    tokens: { input: 157438, output: 2780, cached: 89296, reasoning: 1169 },
++    requests: 7,
++  };
++  const museProvider = {
++    type: 'openai_responses',
++    baseUrl: 'https://muse.example.test:8788/v1',
++    apiKeyEnv: 'MUSE_FORWARDER_KEY',
++  };
++
++  afterEach(() => {
++    vi.unstubAllEnvs();
++    vi.unstubAllGlobals();
++    vi.useRealTimers();
++  });
++
++  it('renders the two quota bars, the reset hints, the tokens line and the version', () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date('2026-10-27T14:03:59Z'));
++    const lines = buildMuseUsageReportLines({ museUsage }).map(strip);
++    const output = lines.join('\n');
++
++    expect(lines[0]).toBe('Muse usage · v1.4.13-R6996.1');
++    expect(output).toContain('Weekly');
++    expect(output).toContain('1% used');
++    expect(output).toContain('resets in 5d 9h 56m');
++    expect(output).toContain('5h window');
++    expect(output).toContain('3% used');
++    expect(output).toContain('resets in 4h');
++    expect(output).toContain('in 154k');
++    expect(output).toContain('out 2.7k');
++    expect(output).toContain('cached 87.2k');
++    expect(output).toContain('reasoning 1.1k');
++    expect(output).toContain('7 requests');
++    expect(output).not.toContain('Plan usage');
++  });
++
++  it('shows the unavailable line instead of bars when the usage could not be read', () => {
++    const lines = buildMuseUsageReportLines({ museUsageError: 'Muse usage unavailable' }).map(strip);
++
++    expect(lines).toEqual(['Muse usage', '  Muse usage unavailable']);
++  });
++
++  it('renders nothing without usage or error', () => {
++    expect(buildMuseUsageReportLines({})).toEqual([]);
++  });
++
++  async function runShowUsage(providers: Record<string, unknown>, fetchImpl: () => Promise<Response>) {
++    vi.stubGlobal('fetch', vi.fn(fetchImpl));
++    const { showUsage } = await import('#/tui/commands/info');
++    const panels: string[][] = [];
++    const host = {
++      session: undefined,
++      state: {
++        appState: {
++          model: 'kimi',
++          availableModels: {},
++          availableProviders: providers,
++          contextUsage: 0,
++          contextTokens: 0,
++          maxContextTokens: 1_000_000,
++        },
++        transcriptContainer: {
++          addChild: (component: { render(width: number): string[] }) => {
++            panels.push(component.render(100).map(strip));
++          },
++        },
++        ui: { requestRender: () => {} },
++      },
++    };
++    await showUsage(host as never);
++    return panels;
++  }
++
++  it('/usage adds a Muse panel when the muse provider is configured, whatever the active model', async () => {
++    vi.stubEnv('MUSE_FORWARDER_KEY', 'muse-key');
++    const sample = {
++      identity: { muse_version: '1.4.13-R6996.1' },
++      requests: 7,
++      subscription: {
++        weekly: { resets_at: 1793577600, used_percent: 1 },
++        window: { resets_at: 1793124239, used_percent: 3, window_duration_mins: 300 },
++      },
++      tokens: { cached: 89296, input: 157438, output: 2780, reasoning: 1169 },
++    };
++    const panels = await runShowUsage({ muse: museProvider }, async () => new Response(JSON.stringify(sample)));
++
++    expect(panels).toHaveLength(2);
++    expect(panels[0]?.[0]).toContain(' Usage ');
++    expect(panels[1]?.[0]).toContain(' Muse ');
++    const muse = panels[1]?.join('\n') ?? '';
++    expect(muse).toContain('Muse usage · v1.4.13-R6996.1');
++    expect(muse).toContain('Weekly');
++    expect(muse).toContain('5h window');
++    expect(muse).toContain('7 requests');
++    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
++    expect(vi.mocked(fetch).mock.calls[0]?.[0]).toBe('https://muse.example.test:8788/usage');
++  });
++
++  it('/usage shows "Muse usage unavailable" when the forwarder cannot be read', async () => {
++    vi.stubEnv('MUSE_FORWARDER_KEY', 'muse-key');
++    const panels = await runShowUsage({ muse: museProvider }, async () => {
++      throw new Error('offline');
++    });
++
++    expect(panels).toHaveLength(2);
++    expect(panels[1]?.join('\n')).toContain('Muse usage unavailable');
++  });
++
++  it('/usage adds no Muse panel without the key or without the provider', async () => {
++    vi.stubEnv('MUSE_FORWARDER_KEY', '');
++    expect(await runShowUsage({ muse: museProvider }, async () => new Response('{}'))).toHaveLength(1);
++    vi.stubEnv('MUSE_FORWARDER_KEY', 'muse-key');
++    expect(await runShowUsage({ other: { ...museProvider, apiKeyEnv: 'OTHER_KEY' } }, async () => new Response('{}'))).toHaveLength(1);
++    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
++  });
++});
+diff --git a/apps/kimi-code/test/utils/billing/muse-usage.test.ts b/apps/kimi-code/test/utils/billing/muse-usage.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f3c43fa8f5d6fd252f2c240c4681127c8292b677
+--- /dev/null
++++ b/apps/kimi-code/test/utils/billing/muse-usage.test.ts
+@@ -0,0 +1,236 @@
++import { describe, expect, it } from 'vitest';
++
++import {
++  configuredMuseEndpoint,
++  fetchMuseUsage,
++  isMuseProvider,
++  museEndpoint,
++  museUsageUrl,
++  parseMuseUsage,
++  toQuotaRows,
++  windowLabel,
++  type MuseUsage,
++} from '#/utils/billing/muse-usage';
++
++/** A real reply of the forwarder's GET /usage. */
++const sample = {
++  identity: {
++    build: '39490bd065c800195489caec34473582f7650b54',
++    client_id: 'tbh:tui',
++    contributor: true,
++    muse_version: '1.4.13-R6996.1',
++  },
++  observed_at: '2026-10-27T13:55:14Z',
++  requests: 7,
++  subscription: {
++    tier: '27681631238169137',
++    weekly: { resets_at: 1793577600, used_percent: 1 },
++    window: { resets_at: 1793124239, used_percent: 3, window_duration_mins: 300 },
++  },
++  tokens: { cached: 89296, input: 157438, output: 2780, reasoning: 1169 },
++};
++
++const parsed: MuseUsage = {
++  weekly: { usedRatio: 0.01, resetAt: '2026-11-02T00:00:00.000Z' },
++  window: { usedRatio: 0.03, resetAt: '2026-10-27T18:03:59.000Z' },
++  windowLabel: '5h window',
++  version: '1.4.13-R6996.1',
++  tokens: { input: 157438, output: 2780, cached: 89296, reasoning: 1169 },
++  requests: 7,
++};
++
++const BASE_URL = 'https://muse.example.test:8788/v1';
++const USAGE_URL = 'https://muse.example.test:8788/usage';
++
++interface Call {
++  url: string;
++  authorization: string | null;
++}
++
++function routedFetch(reply: (url: string) => Response) {
++  const calls: Call[] = [];
++  const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
++    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++    calls.push({ url, authorization: new Headers(init?.headers).get('authorization') });
++    return reply(url);
++  };
++  return { fetcher, calls };
++}
++
++describe('isMuseProvider', () => {
++  it('recognises the provider by its MUSE_FORWARDER_KEY variable', () => {
++    expect(isMuseProvider({ type: 'openai_responses', apiKeyEnv: 'MUSE_FORWARDER_KEY' })).toBe(true);
++    expect(isMuseProvider({ apiKeyEnv: 'MUSE_FORWARDER_KEY' })).toBe(true);
++    expect(isMuseProvider({ type: 'openai_responses', apiKeyEnv: 'OPENROUTER_API_KEY' })).toBe(false);
++    expect(isMuseProvider({ type: 'openai_responses' })).toBe(false);
++    expect(isMuseProvider(undefined)).toBe(false);
++  });
++});
++
++describe('museUsageUrl', () => {
++  it('reads /usage at the root of the forwarder, not under /v1', () => {
++    expect(museUsageUrl(BASE_URL)).toBe(USAGE_URL);
++    expect(museUsageUrl('https://muse.example.test:8788/v1/')).toBe(USAGE_URL);
++    expect(museUsageUrl('https://muse.example.test:8788')).toBe(USAGE_URL);
++    expect(museUsageUrl('http://127.0.0.1:8788/v1/chat')).toBe('http://127.0.0.1:8788/usage');
++  });
++
++  it('rejects a base URL that is not a URL', () => {
++    expect(() => museUsageUrl('not a url')).toThrow();
++  });
++});
++
++describe('windowLabel', () => {
++  it('labels the window from its length in minutes', () => {
++    expect(windowLabel(300)).toBe('5h window');
++    expect(windowLabel(60)).toBe('1h window');
++    expect(windowLabel(45)).toBe('45m window');
++    expect(windowLabel(90)).toBe('1h 30m window');
++    expect(windowLabel(1440)).toBe('24h window');
++  });
++
++  it('falls back to a plain label without a usable length', () => {
++    expect(windowLabel(undefined)).toBe('Window');
++    expect(windowLabel(0)).toBe('Window');
++    expect(windowLabel(-5)).toBe('Window');
++    expect(windowLabel(Number.NaN)).toBe('Window');
++  });
++});
++
++describe('parseMuseUsage', () => {
++  it('parses the forwarder reply into ratios, ISO reset times and token counts', () => {
++    expect(parseMuseUsage(sample)).toEqual(parsed);
++  });
++
++  it('keeps the ratio within 0..1 and tolerates numeric strings', () => {
++    const usage = parseMuseUsage({
++      subscription: {
++        weekly: { used_percent: '250', resets_at: '1793577600' },
++        window: { used_percent: -4, window_duration_mins: '30' },
++      },
++    });
++    expect(usage).toEqual({
++      weekly: { usedRatio: 1, resetAt: '2026-11-02T00:00:00.000Z' },
++      window: { usedRatio: 0, resetAt: undefined },
++      windowLabel: '30m window',
++      version: undefined,
++      tokens: { input: 0, output: 0, cached: 0, reasoning: 0 },
++      requests: undefined,
++    });
++  });
++
++  it('drops a reset time that is not a UNIX timestamp', () => {
++    const usage = parseMuseUsage({
++      subscription: {
++        weekly: { used_percent: 1, resets_at: 'tomorrow' },
++        window: { used_percent: 3, resets_at: null, window_duration_mins: 300 },
++      },
++    });
++    expect(usage?.weekly.resetAt).toBeUndefined();
++    expect(usage?.window.resetAt).toBeUndefined();
++  });
++
++  it.each([
++    ['nothing', undefined],
++    ['null', null],
++    ['a string', 'usage'],
++    ['an array', [sample]],
++    ['an empty object', {}],
++    ['a reply without a subscription', { tokens: sample.tokens, requests: 7 }],
++    ['a subscription without the weekly quota', { subscription: { window: sample.subscription.window } }],
++    ['a subscription without the window quota', { subscription: { weekly: sample.subscription.weekly } }],
++    [
++      'a quota without a numeric percentage',
++      { subscription: { weekly: { used_percent: 'lots' }, window: sample.subscription.window } },
++    ],
++  ])('returns undefined for %s', (_name, json) => {
++    expect(parseMuseUsage(json)).toBeUndefined();
++  });
++});
++
++describe('fetchMuseUsage', () => {
++  it('GETs /usage with the key as a bearer token and parses the reply', async () => {
++    const { fetcher, calls } = routedFetch((url) =>
++      url === USAGE_URL ? new Response(JSON.stringify(sample)) : new Response('{}', { status: 404 }),
++    );
++
++    await expect(fetchMuseUsage(BASE_URL, 'muse-key', fetcher)).resolves.toEqual(parsed);
++    expect(calls).toEqual([{ url: USAGE_URL, authorization: 'Bearer muse-key' }]);
++  });
++
++  it('resolves undefined on an HTTP error', async () => {
++    const { fetcher } = routedFetch(() => new Response('{"error":"down"}', { status: 500 }));
++    await expect(fetchMuseUsage(BASE_URL, 'muse-key', fetcher)).resolves.toBeUndefined();
++  });
++
++  it('resolves undefined when the request throws', async () => {
++    const { fetcher } = routedFetch(() => {
++      throw new Error('offline');
++    });
++    await expect(fetchMuseUsage(BASE_URL, 'muse-key', fetcher)).resolves.toBeUndefined();
++  });
++
++  it('resolves undefined on a body that is not JSON or not a usage reply', async () => {
++    const html = routedFetch(() => new Response('<html>', { status: 200 }));
++    await expect(fetchMuseUsage(BASE_URL, 'muse-key', html.fetcher)).resolves.toBeUndefined();
++    const other = routedFetch(() => new Response('{"ok":true}', { status: 200 }));
++    await expect(fetchMuseUsage(BASE_URL, 'muse-key', other.fetcher)).resolves.toBeUndefined();
++  });
++
++  it('resolves undefined without a key or with an unusable base URL, and reads nothing', async () => {
++    const { fetcher, calls } = routedFetch(() => new Response(JSON.stringify(sample)));
++    await expect(fetchMuseUsage(BASE_URL, undefined, fetcher)).resolves.toBeUndefined();
++    await expect(fetchMuseUsage('not a url', 'muse-key', fetcher)).resolves.toBeUndefined();
++    expect(calls).toHaveLength(0);
++  });
++});
++
++describe('museEndpoint', () => {
++  const provider = { type: 'openai_responses', baseUrl: BASE_URL, apiKeyEnv: 'MUSE_FORWARDER_KEY' };
++
++  it("pairs the provider's base URL with the key from the environment", () => {
++    expect(museEndpoint(provider, undefined, { MUSE_FORWARDER_KEY: ' muse-key ' })).toEqual({
++      baseUrl: BASE_URL,
++      key: 'muse-key',
++    });
++  });
++
++  it("prefers the model's own base URL", () => {
++    const env = { MUSE_FORWARDER_KEY: 'muse-key' };
++    expect(museEndpoint(provider, 'https://other.example.test/v1', env)).toEqual({
++      baseUrl: 'https://other.example.test/v1',
++      key: 'muse-key',
++    });
++  });
++
++  it('is undefined for other providers, without a key, or without a base URL', () => {
++    const env = { MUSE_FORWARDER_KEY: 'muse-key' };
++    expect(museEndpoint(undefined, undefined, env)).toBeUndefined();
++    expect(museEndpoint({ ...provider, apiKeyEnv: 'OPENROUTER_API_KEY' }, undefined, env)).toBeUndefined();
++    expect(museEndpoint(provider, undefined, {})).toBeUndefined();
++    expect(museEndpoint(provider, undefined, { MUSE_FORWARDER_KEY: '  ' })).toBeUndefined();
++    expect(museEndpoint({ ...provider, baseUrl: undefined }, undefined, env)).toBeUndefined();
++  });
++
++  it('finds the configured muse provider among all providers', () => {
++    const providers = {
++      openrouter: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1', apiKeyEnv: 'OPENROUTER_API_KEY' },
++      muse: provider,
++    };
++    expect(configuredMuseEndpoint(providers, { MUSE_FORWARDER_KEY: 'muse-key' })).toEqual({
++      baseUrl: BASE_URL,
++      key: 'muse-key',
++    });
++    expect(configuredMuseEndpoint(providers, {})).toBeUndefined();
++    expect(configuredMuseEndpoint({}, { MUSE_FORWARDER_KEY: 'muse-key' })).toBeUndefined();
++  });
++});
++
++describe('toQuotaRows', () => {
++  it('turns the two quotas into rows for the usage bars', () => {
++    expect(toQuotaRows(parsed)).toEqual([
++      { name: 'Weekly', usedRatio: 0.01, resetAt: '2026-11-02T00:00:00.000Z' },
++      { name: '5h window', usedRatio: 0.03, resetAt: '2026-10-27T18:03:59.000Z' },
++    ]);
++  });
++});
+diff --git a/apps/kimi-code/vitest.config.ts b/apps/kimi-code/vitest.config.ts
+index 47603b80c7b0ec4d227fc158fa774b4cf9219751..53fad2115387a5dd7e19a0d6ae918b2233f33b16 100644
+--- a/apps/kimi-code/vitest.config.ts
++++ b/apps/kimi-code/vitest.config.ts
+@@ -15,11 +15,13 @@ export default defineConfig({
+     env: {
+       KIMI_LOG_LEVEL: 'off',
+       // Tests run inside a `kimi` shell inherit the wrapper's provider keys; blank them so
+-      // the footer's default billing monitor never polls real balances or reads the Keychain.
++      // the footer's default billing monitor never polls real balances or reads the Keychain,
++      // and /usage never asks the muse forwarder.
+       CLOSEROUTER_API_KEY: '',
+       SEVENAPI_API_KEY: '',
+       OPENROUTER_API_KEY: '',
+       OPENROUTER_MANAGEMENT_KEY: '',
++      MUSE_FORWARDER_KEY: '',
+     },
+     include: ['test/**/*.test.ts', 'test/**/*.test.tsx'],
+   },
+-- 
+2.50.1 (Apple Git-155)
+
