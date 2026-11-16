@@ -346,6 +346,35 @@ Code:
 
 Tests (apps/kimi-code): `test/utils/billing/muse-usage.test.ts`, the `Muse usage panel` cases in `test/tui/components/messages/usage-panel.test.ts`, the `web muse usage route` cases in `test/cli/web/balance-badge.test.ts`.
 
+## 15. Gemini forwarder usage (`0015-…`)
+
+The gemini provider (`[providers.gemini]` in `config.toml`, base URL `https://<host>:8790/v1`) is a second relay next to muse. Its `GET /usage` has the muse forwarder's shape on purpose, so this feature extends feature 14 to both instead of adding a parallel one. It changes these things in feature 14:
+
+- A forwarder is a provider whose `api_key_env` is `MUSE_FORWARDER_KEY` **or** `GEMINI_FORWARDER_KEY`; the key is read from the variable the provider names. The gemini forwarder accepts the muse key and is normally configured with it, so the variable does not tell the two relays apart. Which one answered is read from the reply: an `identity.agy_version` means gemini, anything else muse.
+- CLI: `/usage` adds one panel per configured forwarder, in config order, titled ` Muse ` or ` Gemini ` (one per usage URL, so two provider entries for the same relay give one panel). A forwarder that cannot be read shows `Muse usage unavailable` or `Gemini usage unavailable`; with no reply to go by, the name is a guess: gemini when the provider id contains `gemini` or it names `GEMINI_FORWARDER_KEY`, else muse.
+- The Gemini panel: heading `Gemini usage · agy <agy_version>`, then a weekly and a 5h bar for each quota group the forwarder reports (`Gemini Models weekly`, `Gemini Models 5h`, `Claude and GPT models weekly`, `Claude and GPT models 5h`), then the same tokens line as muse.
+- Web: the pill reads `Gemini  weekly 0% · 5h 1%` while the open session's model is served by the gemini forwarder (title `Gemini subscription usage (agy 1.5.9)`), with the quotas of that model's own group: `gemini/opus` shows the Claude group, `gemini/carbon` the Gemini group. The route and the pill's element id are feature 14's.
+
+The gemini reply looks like `{"identity":{"agy_version":"1.5.9","email":…,"tier":"free-tier",…},"requests":2,"subscription":{"weekly":{"bucket":"gemini-weekly","resets_at":"2026-11-23T08:29:17Z","used_percent":0.16},"window":{"bucket":"gemini-5h","resets_at":"2026-11-16T13:29:17Z","used_percent":0.64,"window_duration_mins":300},"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","used_percent":0.16,"resets_at":"2026-11-23T08:29:17Z"},{"id":"gemini-5h","window":"5h","used_percent":0.64,"resets_at":"2026-11-16T13:29:17Z"}]},{"name":"Claude and GPT models","buckets":[…]}],"models":[{"model":"claude-opus-5-5-high","used_percent":0.09,"resets_at":"2026-11-16T13:56:09Z"},…]},"tokens":{"cached":0,"input":19970,"output":81,"reasoning":60}}`. Differences from muse: `resets_at` is an ISO string, percentages are fractional, and `subscription.weekly` / `subscription.window` are only the most used group's.
+
+Code (all in feature 14's files):
+
+- `apps/kimi-code/src/utils/billing/muse-usage.ts`
+  - `GEMINI_API_KEY_ENV`; `isMuseProvider()` accepts both variables; `museEndpoint()` reads the key from `env[provider.apiKeyEnv]`.
+  - `configuredMuseEndpoints()` replaces `configuredMuseEndpoint()`: every forwarder among the providers, one per usage URL, each with the guessed `name`.
+  - `parseMuseUsage()` sets `name` (`'Muse' | 'Gemini'`), takes `version` from `agy_version` for gemini, accepts `resets_at` as UNIX seconds or a date string, and parses `subscription.groups` into `groups` (`{ name, weekly, window, windowLabel }`; a group needs a name, its `weekly` bucket and one other bucket) and `subscription.models` into `modelResets` (model slug → reset time). `groups` and `modelResets` are absent for muse. Nothing of `identity` but the version is kept: it carries the account's email, and the parsed object is what the web route sends to the browser.
+  - `museUsageForModel()` gives one model its own group's quotas and drops `groups` / `modelResets`. The model's group is the one whose window bucket resets when the model's entry in `subscription.models` does; an `@<account>` suffix on the slug is ignored; a model the reply does not list keeps the most used group's quotas.
+  - `toQuotaRows()` returns two rows per group when there are groups.
+- `apps/kimi-code/src/tui/commands/info.ts`: `loadMuseUsageReports()` reads all forwarders concurrently; `showUsage()` adds one `UsagePanelComponent` per result, titled with its name.
+- `apps/kimi-code/src/tui/components/messages/usage-panel.ts`: `buildMuseUsageReportLines()` takes the heading's name from the usage, else from the new `name` option, and writes the version as `v<muse_version>` or `agy <agy_version>`.
+- `apps/kimi-code/src/cli/sub/web/balance-badge.ts`: the muse-usage route passes the reply through `museUsageForModel()` with the alias's model slug before caching it.
+- `apps/kimi-code/src/cli/sub/web/balance-badge-script.ts`: the pill's label and title use the reply's `name`.
+- `apps/kimi-code/vitest.config.ts`: blanks `GEMINI_FORWARDER_KEY` too.
+
+Not a patch: the gemini provider and its six model aliases are configuration (`config/config.toml.example`), and `scripts/kimi-launcher.sh` exports `GEMINI_FORWARDER_KEY` from the Keychain when it is stored and trusts both forwarders' certificates. `NODE_EXTRA_CA_CERTS` names a single file, so when `~/.kimi-code/muse-forwarder.crt` and `~/.kimi-code/gemini-forwarder.crt` both exist the launcher joins them into `~/.kimi-code/forwarder-ca.pem`.
+
+Tests (apps/kimi-code): the gemini cases in `test/utils/billing/muse-usage.test.ts` (`parseMuseUsage`, `museUsageForModel`, `configuredMuseEndpoints`, `toQuotaRows`), the gemini cases of `Muse usage panel` in `test/tui/components/messages/usage-panel.test.ts`, and in `test/cli/web/balance-badge.test.ts` the gemini route case and `the badge script names the pill after the forwarder that answered`, which runs the browser script against a stub page.
+
 ## When a patch conflicts
 
 `update.sh` stops, leaves the new release in `source.next` with the patch half-applied, and keeps your current `kimi` running.

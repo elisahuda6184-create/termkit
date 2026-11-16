@@ -1,0 +1,1070 @@
+From 03a29a1cc70b4d37a0a3eacc0a322d8992484b72 Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Mon, 16 Nov 2026 16:36:42 +0700
+Subject: [PATCH 15/15] customkimi: show the gemini forwarder's usage in /usage
+ and the web UI
+
+The gemini forwarder's GET /usage has the muse forwarder's shape, so the
+muse usage feature now covers both: /usage adds one panel per configured
+forwarder (" Muse ", " Gemini "), and the web pill is named after the
+forwarder serving the open session's model. A forwarder is a provider
+whose key variable is MUSE_FORWARDER_KEY or GEMINI_FORWARDER_KEY; the
+gemini forwarder is usually configured with the muse key, so which one
+answered is read from the reply (identity.agy_version). Gemini reports
+two quota groups (Gemini models; Claude and GPT models): the panel shows
+the weekly and 5h bars of each, and the pill shows those of the model's
+own group. Reset times may be ISO strings as well as UNIX seconds.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../src/cli/sub/web/balance-badge-script.ts   |  22 +-
+ .../src/cli/sub/web/balance-badge.ts          |  15 +-
+ apps/kimi-code/src/tui/commands/info.ts       |  38 ++--
+ .../tui/components/messages/usage-panel.ts    |  11 +-
+ .../kimi-code/src/utils/billing/muse-usage.ts | 165 ++++++++++++---
+ .../test/cli/web/balance-badge.test.ts        | 104 ++++++++++
+ .../components/messages/usage-panel.test.ts   | 129 +++++++++++-
+ .../test/utils/billing/muse-usage.test.ts     | 190 +++++++++++++++++-
+ apps/kimi-code/vitest.config.ts               |   3 +-
+ 9 files changed, 604 insertions(+), 73 deletions(-)
+
+diff --git a/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts b/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts
+index 03b4b2808885fc0de5b75f5d0a98270846aba235..3e20e7140f7999fcacb5ba4ab5ded1cf06cf4cf6 100644
+--- a/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts
++++ b/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts
+@@ -1,12 +1,12 @@
+ /**
+- * Browser script for the web UI balance badge and the muse usage pill. They sit just before
+- * the model picker in the composer toolbar (`.mp-name`); if a web UI update moves the
+- * picker, they fall back to small fixed pills in the bottom-right corner. The script reads
+- * the web UI's own stored credential, asks the session API for the open session's model,
+- * refreshes every minute and whenever the session or model changes, and hides each pill
+- * when its route reports nothing (no balance; a model not served by the muse provider).
+- * A credential the server rejects is never retried, so the badge cannot trip the
+- * server's failed-auth rate limit.
++ * Browser script for the web UI balance badge and the usage pill of the forwarders (muse,
++ * gemini). They sit just before the model picker in the composer toolbar (`.mp-name`); if
++ * a web UI update moves the picker, they fall back to small fixed pills in the bottom-right
++ * corner. The script reads the web UI's own stored credential, asks the session API for the
++ * open session's model, refreshes every minute and whenever the session or model changes,
++ * and hides each pill when its route reports nothing (no balance; a model not served by a
++ * forwarder). A credential the server rejects is never retried, so the badge cannot trip
++ * the server's failed-auth rate limit.
+  */
+ export function balanceBadgeScript(apiPath: string, museApiPath: string): string {
+   return `(function () {
+@@ -147,9 +147,11 @@ export function balanceBadgeScript(apiPath: string, museApiPath: string): string
+     }
+     if (museBadge) {
+       var short = typeof muse.windowLabel === 'string' ? muse.windowLabel.replace(/ window$/, '') : 'window';
+-      var museText = 'Muse  weekly ' + percent(muse.weekly) + ' · ' + short + ' ' + percent(muse.window);
++      var name = muse.name === 'Gemini' ? 'Gemini' : 'Muse';
++      var museText = name + '  weekly ' + percent(muse.weekly) + ' · ' + short + ' ' + percent(muse.window);
+       if (museBadge.textContent !== museText) museBadge.textContent = museText;
+-      museBadge.title = 'Muse subscription usage' + (muse.version ? ' (muse ' + muse.version + ')' : '');
++      museBadge.title = name + ' subscription usage' +
++        (muse.version ? ' (' + (name === 'Gemini' ? 'agy ' : 'muse ') + muse.version + ')' : '');
+       place(museBadge, null);
+     }
+   }
+diff --git a/apps/kimi-code/src/cli/sub/web/balance-badge.ts b/apps/kimi-code/src/cli/sub/web/balance-badge.ts
+index 10c9b747c25de8689fb88d840aed621a47647cce..176c622f24dbae5e46754ed81122768e5afff26f 100644
+--- a/apps/kimi-code/src/cli/sub/web/balance-badge.ts
++++ b/apps/kimi-code/src/cli/sub/web/balance-badge.ts
+@@ -7,7 +7,7 @@ import {
+ 
+ import { modelResolver, type BillingSource } from '#/utils/billing/billing-monitor';
+ import { asRecord, type BillingEnv } from '#/utils/billing/billing-provider';
+-import { fetchMuseUsage, museEndpoint, type MuseUsage } from '#/utils/billing/muse-usage';
++import { fetchMuseUsage, museEndpoint, museUsageForModel, type MuseUsage } from '#/utils/billing/muse-usage';
+ 
+ import { balanceBadgeScript } from './balance-badge-script';
+ 
+@@ -92,9 +92,11 @@ export function registerBalanceBadge(
+ 
+ /**
+  * Adds `GET /api/customkimi/muse-usage?model=<alias>` (bearer auth like every /api route):
+- * the muse subscription's usage when the alias, or without one the default model, is served
+- * by the muse provider, else null. Replies are cached per alias for a minute, in-flight
+- * requests included, so the browser's refreshes do not all reach the forwarder.
++ * the subscription's usage when the alias, or without one the default model, is served by
++ * a forwarder (muse or gemini; `name` in the reply says which), else null. For a gemini
++ * model the quotas are those of the model's own group. Replies are cached per alias for a
++ * minute, in-flight requests included, so the browser's refreshes do not all reach the
++ * forwarder.
+  */
+ export function registerMuseUsageRoute(app: BadgeRouteHost, options: MuseUsageRouteOptions = {}): void {
+   const loadConfig = options.loadConfig ?? loadBadgeConfig;
+@@ -110,7 +112,10 @@ export function registerMuseUsageRoute(app: BadgeRouteHost, options: MuseUsageRo
+     if (endpoint === undefined) return Promise.resolve(undefined);
+     const cached = cache.get(alias);
+     if (cached !== undefined && cached.expiresAt > now()) return cached.usage;
+-    const usage = fetchUsage(endpoint.baseUrl, endpoint.key);
++    const slug = model?.model;
++    const usage = fetchUsage(endpoint.baseUrl, endpoint.key).then((reply) =>
++      reply === undefined || slug === undefined ? reply : museUsageForModel(reply, slug),
++    );
+     cache.set(alias, { expiresAt: now() + MUSE_USAGE_CACHE_MS, usage });
+     return usage;
+   };
+diff --git a/apps/kimi-code/src/tui/commands/info.ts b/apps/kimi-code/src/tui/commands/info.ts
+index 8122b046678395ef515070cc6ded8cdc20aaca88..08214a989055c074f0f4afc60f4ef884d6485c06 100644
+--- a/apps/kimi-code/src/tui/commands/info.ts
++++ b/apps/kimi-code/src/tui/commands/info.ts
+@@ -11,7 +11,7 @@ import {
+   type ManagedUsageReport,
+ } from '../components/messages/usage-panel';
+ import { isExperimentalFlagEnabled } from './experimental-flags';
+-import { configuredMuseEndpoint, fetchMuseUsage, type MuseUsage } from '#/utils/billing/muse-usage';
++import { configuredMuseEndpoints, fetchMuseUsage, type MuseUsage } from '#/utils/billing/muse-usage';
+ import { quotaUsageRows } from '#/utils/usage/usage-format';
+ import {
+   FEEDBACK_ISSUE_URL,
+@@ -153,17 +153,17 @@ interface ManagedUsageResult {
+ }
+ 
+ interface MuseUsageResult {
++  /** "Muse" or "Gemini": the forwarder the panel is about. */
++  readonly name: string;
+   readonly usage?: MuseUsage;
+   readonly error?: string;
+ }
+ 
+-const MUSE_USAGE_UNAVAILABLE = 'Muse usage unavailable';
+-
+ export async function showUsage(host: SlashCommandHost): Promise<void> {
+   const sessionUsage = await loadSessionUsageReport(host);
+-  const [managedUsage, museUsage] = await Promise.all([
++  const [managedUsage, museUsages] = await Promise.all([
+     loadManagedUsageReport(host),
+-    loadMuseUsageReport(host),
++    loadMuseUsageReports(host),
+   ]);
+   const reportArgs = {
+     sessionUsage: sessionUsage.usage,
+@@ -176,10 +176,10 @@ export async function showUsage(host: SlashCommandHost): Promise<void> {
+   };
+   const panel = new UsagePanelComponent(() => buildUsageReportLines(reportArgs), 'primary');
+   host.state.transcriptContainer.addChild(panel);
+-  if (museUsage !== undefined) {
+-    const museArgs = { museUsage: museUsage.usage, museUsageError: museUsage.error };
++  for (const { name, usage, error } of museUsages) {
++    const museArgs = { name, museUsage: usage, museUsageError: error };
+     host.state.transcriptContainer.addChild(
+-      new UsagePanelComponent(() => buildMuseUsageReportLines(museArgs), 'primary', ' Muse '),
++      new UsagePanelComponent(() => buildMuseUsageReportLines(museArgs), 'primary', ` ${name} `),
+     );
+   }
+   host.state.ui.requestRender();
+@@ -277,14 +277,20 @@ async function loadManagedUsageReport(host: SlashCommandHost): Promise<ManagedUs
+ }
+ 
+ /**
+- * CustomKIMI: the muse subscription's quotas, read from the forwarder whenever the muse
+- * provider is configured, whichever model is active. Undefined when it is not configured.
++ * CustomKIMI: the quotas of every configured forwarder (muse, gemini), read from each
++ * whichever model is active; one result per forwarder, none when none is configured.
+  * `/usage` is dispatched fire-and-forget, so this never throws: `fetchMuseUsage` resolves
+- * undefined on every failure, which the panel shows as "Muse usage unavailable".
++ * undefined on every failure, which the panel shows as "Muse usage unavailable" (or
++ * "Gemini usage unavailable").
+  */
+-async function loadMuseUsageReport(host: SlashCommandHost): Promise<MuseUsageResult | undefined> {
+-  const endpoint = configuredMuseEndpoint(host.state.appState.availableProviders);
+-  if (endpoint === undefined) return undefined;
+-  const usage = await fetchMuseUsage(endpoint.baseUrl, endpoint.key);
+-  return usage === undefined ? { error: MUSE_USAGE_UNAVAILABLE } : { usage };
++async function loadMuseUsageReports(host: SlashCommandHost): Promise<MuseUsageResult[]> {
++  const endpoints = configuredMuseEndpoints(host.state.appState.availableProviders);
++  return Promise.all(
++    endpoints.map(async (endpoint) => {
++      const usage = await fetchMuseUsage(endpoint.baseUrl, endpoint.key);
++      return usage === undefined
++        ? { name: endpoint.name, error: `${endpoint.name} usage unavailable` }
++        : { name: usage.name, usage };
++    }),
++  );
+ }
+diff --git a/apps/kimi-code/src/tui/components/messages/usage-panel.ts b/apps/kimi-code/src/tui/components/messages/usage-panel.ts
+index 46d49b8e588b8f9bb1f52aa29661f75c61ca467d..2a0b36bd73cabaea1ba2dbdadcbdb836b4ca14b7 100644
+--- a/apps/kimi-code/src/tui/components/messages/usage-panel.ts
++++ b/apps/kimi-code/src/tui/components/messages/usage-panel.ts
+@@ -67,6 +67,8 @@ export interface ManagedUsageReportLineOptions {
+ }
+ 
+ export interface MuseUsageReportLineOptions {
++  /** The forwarder to name in the heading while there is no usage to take it from. */
++  readonly name?: string;
+   readonly museUsage?: MuseUsage;
+   readonly museUsageError?: string;
+ }
+@@ -263,8 +265,9 @@ export function buildManagedUsageReportLines(options: ManagedUsageReportLineOpti
+ }
+ 
+ /**
+- * The `/usage` Muse panel: the subscription's two quotas as bars under a heading that
+- * carries the muse version, then the token counts and the request count.
++ * The `/usage` panel of a forwarder (Muse, Gemini): the subscription's quotas as bars under
++ * a heading that carries the version (muse's own, or the agy client's the gemini forwarder
++ * mirrors), then the token counts and the request count.
+  */
+ export function buildMuseUsageReportLines(options: MuseUsageReportLineOptions): string[] {
+   const accent = (text: string) => currentTheme.boldFg('primary', text);
+@@ -273,7 +276,9 @@ export function buildMuseUsageReportLines(options: MuseUsageReportLineOptions):
+   const errorStyle = (text: string) => currentTheme.fg('error', text);
+ 
+   const usage = options.museUsage;
+-  const heading = usage?.version === undefined ? 'Muse usage' : `Muse usage · v${usage.version}`;
++  const name = usage?.name ?? options.name ?? 'Muse';
++  const version = usage?.version === undefined ? '' : ` · ${name === 'Gemini' ? 'agy ' : 'v'}${usage.version}`;
++  const heading = `${name} usage${version}`;
+   const lines = buildManagedUsageSection(
+     usage === undefined ? undefined : { rows: toQuotaRows(usage) },
+     options.museUsageError,
+diff --git a/apps/kimi-code/src/utils/billing/muse-usage.ts b/apps/kimi-code/src/utils/billing/muse-usage.ts
+index 5c7e1f881cf94eb85cb0bb27dcd2688f2f1c471f..704d089b5c2d5ca2ced09b4d58804ab00287a1ba 100644
+--- a/apps/kimi-code/src/utils/billing/muse-usage.ts
++++ b/apps/kimi-code/src/utils/billing/muse-usage.ts
+@@ -4,6 +4,11 @@ import { asRecord, toFiniteNumber, type BillingEnv, type Fetcher } from './billi
+ 
+ /** The environment variable a provider reads its key from when it is the muse forwarder. */
+ export const MUSE_API_KEY_ENV = 'MUSE_FORWARDER_KEY';
++/** The gemini forwarder's own key variable; that forwarder accepts the muse key as well. */
++export const GEMINI_API_KEY_ENV = 'GEMINI_FORWARDER_KEY';
++
++/** The forwarders whose GET /usage has this shape. */
++export type ForwarderName = 'Muse' | 'Gemini';
+ 
+ const REQUEST_TIMEOUT_MS = 5_000;
+ 
+@@ -20,8 +25,18 @@ export interface MuseTokens {
+   readonly reasoning: number;
+ }
+ 
+-/** What the forwarder's GET /usage reports about the muse subscription. */
++/** The quotas the models of one group share (the gemini forwarder reports two groups). */
++export interface MuseQuotaGroup {
++  readonly name: string;
++  readonly weekly: MuseWindow;
++  readonly window: MuseWindow;
++  readonly windowLabel: string;
++}
++
++/** What a forwarder's GET /usage reports about its subscription. */
+ export interface MuseUsage {
++  /** The forwarder that answered. */
++  readonly name: ForwarderName;
+   readonly weekly: MuseWindow;
+   /** The short rolling window; `windowLabel` names its length ("5h window"). */
+   readonly window: MuseWindow;
+@@ -29,6 +44,10 @@ export interface MuseUsage {
+   readonly version?: string;
+   readonly tokens: MuseTokens;
+   readonly requests?: number;
++  /** Gemini only: its quota groups; `weekly` and `window` above are those of the most used one. */
++  readonly groups?: readonly MuseQuotaGroup[];
++  /** Gemini only: when each model's quota resets (ISO 8601), which names the model's group. */
++  readonly modelResets?: Readonly<Record<string, string>>;
+ }
+ 
+ /** Where the usage is read from, and with which key. */
+@@ -37,6 +56,11 @@ export interface MuseEndpoint {
+   readonly key: string;
+ }
+ 
++/** A configured forwarder, with the name to show for it while it has not answered. */
++export interface ConfiguredMuseEndpoint extends MuseEndpoint {
++  readonly name: ForwarderName;
++}
++
+ /** The parts of a provider's configuration the usage lookup reads. */
+ export interface MuseProviderConfig {
+   readonly type?: string;
+@@ -45,12 +69,13 @@ export interface MuseProviderConfig {
+ }
+ 
+ /**
+- * The muse forwarder is a subscription, not a prepaid balance, so it is not a
+- * `BillingProvider`: both renderers of `ProviderBalance` format dollars. It is recognised by
+- * the key variable its provider entry names.
++ * A forwarder is a subscription, not a prepaid balance, so it is not a `BillingProvider`:
++ * both renderers of `ProviderBalance` format dollars. It is recognised by the key variable
++ * its provider entry names. The gemini forwarder is usually configured with the muse key,
++ * so the variable does not tell the two apart: the reply does (`MuseUsage.name`).
+  */
+ export function isMuseProvider(provider: MuseProviderConfig | undefined): boolean {
+-  return provider?.apiKeyEnv === MUSE_API_KEY_ENV;
++  return provider?.apiKeyEnv === MUSE_API_KEY_ENV || provider?.apiKeyEnv === GEMINI_API_KEY_ENV;
+ }
+ 
+ /** The forwarder's usage endpoint: /usage lives at the root of the host, next to /v1. */
+@@ -60,29 +85,44 @@ export function museUsageUrl(baseUrl: string): string {
+ 
+ /**
+  * The forwarder's endpoint for `provider`, read at `baseUrl` (a model's own base URL, else
+- * the provider's), or undefined when the provider is not the muse forwarder, has no base
+- * URL, or its key is not set (blank counts as unset).
++ * the provider's), or undefined when the provider is not a forwarder, has no base URL, or
++ * the key variable it names is not set (blank counts as unset).
+  */
+ export function museEndpoint(
+   provider: MuseProviderConfig | undefined,
+   baseUrl: string | undefined = provider?.baseUrl,
+   env: BillingEnv = process.env,
+ ): MuseEndpoint | undefined {
+-  if (!isMuseProvider(provider)) return undefined;
+-  const key = env[MUSE_API_KEY_ENV]?.trim();
++  if (!isMuseProvider(provider) || provider?.apiKeyEnv === undefined) return undefined;
++  const key = env[provider.apiKeyEnv]?.trim();
+   return baseUrl === undefined || key === undefined || key === '' ? undefined : { baseUrl, key };
+ }
+ 
+-/** The endpoint of the muse provider among `providers`, whichever model is active. */
+-export function configuredMuseEndpoint(
++/**
++ * The endpoints of the forwarders among `providers`, whichever model is active, one per
++ * usage URL. Until a forwarder answers, its name is a guess from its provider entry.
++ */
++export function configuredMuseEndpoints(
+   providers: Readonly<Record<string, MuseProviderConfig>>,
+   env: BillingEnv = process.env,
+-): MuseEndpoint | undefined {
+-  for (const provider of Object.values(providers)) {
++): ConfiguredMuseEndpoint[] {
++  const endpoints = new Map<string, ConfiguredMuseEndpoint>();
++  for (const [id, provider] of Object.entries(providers)) {
+     const endpoint = museEndpoint(provider, provider.baseUrl, env);
+-    if (endpoint !== undefined) return endpoint;
++    if (endpoint === undefined) continue;
++    const gemini = provider.apiKeyEnv === GEMINI_API_KEY_ENV || id.toLowerCase().includes('gemini');
++    const url = usageUrlOrBase(endpoint.baseUrl);
++    if (!endpoints.has(url)) endpoints.set(url, { ...endpoint, name: gemini ? 'Gemini' : 'Muse' });
++  }
++  return [...endpoints.values()];
++}
++
++function usageUrlOrBase(baseUrl: string): string {
++  try {
++    return museUsageUrl(baseUrl);
++  } catch {
++    return baseUrl;
+   }
+-  return undefined;
+ }
+ 
+ /** "5h window", "45m window" or "1h 30m window" from the window's length; "Window" without one. */
+@@ -96,9 +136,11 @@ export function windowLabel(minutes: number | undefined): string {
+ }
+ 
+ /**
+- * The usage from the forwarder's reply, or undefined unless both quotas carry a numeric
+- * `used_percent`. Percentages become 0..1 ratios; `resets_at` (UNIX seconds) becomes an ISO
+- * string, which is what the usage panel's reset hint parses.
++ * The usage from a forwarder's reply, or undefined unless both quotas carry a numeric
++ * `used_percent`. Percentages become 0..1 ratios; `resets_at` (UNIX seconds from muse, an
++ * ISO string from gemini) becomes an ISO string, which is what the usage panel's reset hint
++ * parses. The gemini forwarder is told by the `agy_version` in its identity; nothing else
++ * of the identity (it carries the account's email) is kept.
+  */
+ export function parseMuseUsage(json: unknown): MuseUsage | undefined {
+   const reply = asRecord(json);
+@@ -108,8 +150,12 @@ export function parseMuseUsage(json: unknown): MuseUsage | undefined {
+   const windowQuota = parseWindow(window);
+   if (weekly === undefined || windowQuota === undefined) return undefined;
+   const tokens = asRecord(reply?.['tokens']);
+-  const version = asRecord(reply?.['identity'])?.['muse_version'];
++  const identity = asRecord(reply?.['identity']);
++  const gemini = identity?.['agy_version'] !== undefined;
++  const version = identity?.[gemini ? 'agy_version' : 'muse_version'];
++  const groups = parseGroups(subscription?.['groups']);
+   return {
++    name: gemini ? 'Gemini' : 'Muse',
+     weekly,
+     window: windowQuota,
+     windowLabel: windowLabel(toFiniteNumber(window?.['window_duration_mins'])),
+@@ -121,6 +167,7 @@ export function parseMuseUsage(json: unknown): MuseUsage | undefined {
+       reasoning: tokenCount(tokens?.['reasoning']),
+     },
+     requests: toFiniteNumber(reply?.['requests']),
++    ...(groups.length === 0 ? {} : { groups, modelResets: parseModelResets(subscription?.['models']) }),
+   };
+ }
+ 
+@@ -130,17 +177,66 @@ function parseWindow(value: unknown): MuseWindow | undefined {
+   if (percent === undefined) return undefined;
+   return {
+     usedRatio: Math.max(0, Math.min(percent / 100, 1)),
+-    resetAt: isoFromUnixSeconds(quota?.['resets_at']),
++    resetAt: isoFromReset(quota?.['resets_at']),
+   };
+ }
+ 
+-function isoFromUnixSeconds(value: unknown): string | undefined {
++/** UNIX seconds (a number or a numeric string) or a date string, as an ISO string. */
++function isoFromReset(value: unknown): string | undefined {
+   const seconds = toFiniteNumber(value);
+-  if (seconds === undefined) return undefined;
+-  const date = new Date(seconds * 1000);
++  if (seconds === undefined && typeof value !== 'string') return undefined;
++  const date = seconds === undefined ? new Date(value as string) : new Date(seconds * 1000);
+   return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+ }
+ 
++/**
++ * The groups of `subscription.groups`: `{ name, buckets: [{ window: "weekly" | "5h", … }] }`.
++ * A group needs a name, its weekly bucket and one other bucket, which is its window.
++ */
++function parseGroups(value: unknown): MuseQuotaGroup[] {
++  const groups: MuseQuotaGroup[] = [];
++  for (const entry of Array.isArray(value) ? value : []) {
++    const group = asRecord(entry);
++    const name = group?.['name'];
++    const buckets = (Array.isArray(group?.['buckets']) ? group['buckets'] : []).map(asRecord);
++    const weeklyBucket = buckets.find((bucket) => bucket?.['window'] === 'weekly');
++    const windowBucket = buckets.find((bucket) => bucket !== undefined && bucket !== weeklyBucket);
++    const weekly = parseWindow(weeklyBucket);
++    const window = parseWindow(windowBucket);
++    const length = windowBucket?.['window'];
++    if (typeof name !== 'string' || name === '' || weekly === undefined || window === undefined) continue;
++    const windowLabel = typeof length === 'string' && length !== '' ? `${length} window` : 'Window';
++    groups.push({ name, weekly, window, windowLabel });
++  }
++  return groups;
++}
++
++/** `subscription.models` (`[{ model, resets_at }]`) as the reset time of each model slug. */
++function parseModelResets(value: unknown): Record<string, string> {
++  const resets: Record<string, string> = {};
++  for (const entry of Array.isArray(value) ? value : []) {
++    const quota = asRecord(entry);
++    const model = quota?.['model'];
++    const resetAt = isoFromReset(quota?.['resets_at']);
++    if (typeof model === 'string' && resetAt !== undefined) resets[model] = resetAt;
++  }
++  return resets;
++}
++
++/**
++ * The usage as it applies to one model, without the per-group detail. The gemini
++ * forwarder's models do not share one quota, so the weekly and window quotas become those
++ * of the model's group: the one whose window resets when the model's own quota does. An
++ * account selector on the slug (`model@account`) is not part of the model's name.
++ */
++export function museUsageForModel(usage: MuseUsage, model: string): MuseUsage {
++  const { groups, modelResets, ...shared } = usage;
++  const resetAt = modelResets?.[model.replace(/@.*$/, '')];
++  const group = resetAt === undefined ? undefined : groups?.find((g) => g.window.resetAt === resetAt);
++  if (group === undefined) return shared;
++  return { ...shared, weekly: group.weekly, window: group.window, windowLabel: group.windowLabel };
++}
++
+ function tokenCount(value: unknown): number {
+   const count = toFiniteNumber(value);
+   return count === undefined || count < 0 ? 0 : count;
+@@ -168,10 +264,23 @@ export async function fetchMuseUsage(
+   }
+ }
+ 
+-/** The two quotas as rows of the usage panel's bar renderer. */
++/**
++ * The quotas as rows of the usage panel's bar renderer: the two of the subscription, or
++ * the two of every group ("Gemini Models weekly", "Gemini Models 5h") when it has groups.
++ */
+ export function toQuotaRows(usage: MuseUsage): QuotaUsageRow[] {
+-  return [
+-    { name: 'Weekly', usedRatio: usage.weekly.usedRatio, resetAt: usage.weekly.resetAt },
+-    { name: usage.windowLabel, usedRatio: usage.window.usedRatio, resetAt: usage.window.resetAt },
+-  ];
++  if (usage.groups === undefined || usage.groups.length === 0) {
++    return [
++      { name: 'Weekly', usedRatio: usage.weekly.usedRatio, resetAt: usage.weekly.resetAt },
++      { name: usage.windowLabel, usedRatio: usage.window.usedRatio, resetAt: usage.window.resetAt },
++    ];
++  }
++  return usage.groups.flatMap((group) => [
++    { name: `${group.name} weekly`, usedRatio: group.weekly.usedRatio, resetAt: group.weekly.resetAt },
++    {
++      name: `${group.name} ${group.windowLabel.replace(/ window$/, '')}`,
++      usedRatio: group.window.usedRatio,
++      resetAt: group.window.resetAt,
++    },
++  ]);
+ }
+diff --git a/apps/kimi-code/test/cli/web/balance-badge.test.ts b/apps/kimi-code/test/cli/web/balance-badge.test.ts
+index d09c1cb7babfee04af34bb671f2070e1be9954b5..7e7b7cd33155e9810918e79e736a2eeb0d55e860 100644
+--- a/apps/kimi-code/test/cli/web/balance-badge.test.ts
++++ b/apps/kimi-code/test/cli/web/balance-badge.test.ts
+@@ -1,3 +1,5 @@
++import { runInNewContext } from 'node:vm';
++
+ import { describe, expect, it, vi } from 'vitest';
+ 
+ import {
+@@ -24,12 +26,15 @@ const config: BadgeConfig = {
+     'other/model': { provider: 'other', model: 'model' },
+     'muse/wonder-1.0': { provider: 'muse', model: 'muse-wonder-1.0' },
+     'muse/mirror': { provider: 'muse', model: 'muse-wonder-1.0', baseUrl: 'https://mirror.example.test/v1' },
++    'gemini/carbon': { provider: 'gemini', model: 'gemini-4-carbon-high' },
++    'gemini/opus': { provider: 'gemini', model: 'claude-opus-5-5-high@someone' },
+   },
+   providers: {
+     '7api-responses': { baseUrl: 'https://7api.st/v1' },
+     closerouter: { baseUrl: 'https://api.closerouter.dev/v1' },
+     other: { baseUrl: 'https://other.example/v1' },
+     muse: { baseUrl: 'https://muse.example.test:8788/v1', apiKeyEnv: 'MUSE_FORWARDER_KEY' },
++    gemini: { baseUrl: 'https://muse.example.test:8790/v1', apiKeyEnv: 'MUSE_FORWARDER_KEY' },
+   },
+ };
+ 
+@@ -108,6 +113,7 @@ describe('web balance badge route', () => {
+ 
+ describe('web muse usage route', () => {
+   const usage: MuseUsage = {
++    name: 'Muse',
+     weekly: { usedRatio: 0.01, resetAt: '2026-11-02T00:00:00.000Z' },
+     window: { usedRatio: 0.03, resetAt: '2026-10-27T18:03:59.000Z' },
+     windowLabel: '5h window',
+@@ -211,4 +217,102 @@ describe('web muse usage route', () => {
+     expect((await second).payload).toEqual({ code: 0, msg: 'success', data: usage });
+     expect(fetchUsage).toHaveBeenCalledTimes(1);
+   });
++
++  const claudeGroup = {
++    name: 'Claude and GPT models',
++    weekly: { usedRatio: 0.3, resetAt: '2026-11-23T08:56:09.000Z' },
++    window: { usedRatio: 0.5, resetAt: '2026-11-16T13:56:09.000Z' },
++    windowLabel: '5h window',
++  };
++  const geminiUsage: MuseUsage = {
++    name: 'Gemini',
++    weekly: { usedRatio: 0.0016, resetAt: '2026-11-23T08:29:17.000Z' },
++    window: { usedRatio: 0.0064, resetAt: '2026-11-16T13:29:17.000Z' },
++    windowLabel: '5h window',
++    version: '1.5.9',
++    tokens: { input: 19970, output: 81, cached: 0, reasoning: 60 },
++    requests: 2,
++    groups: [
++      {
++        name: 'Gemini Models',
++        weekly: { usedRatio: 0.0016, resetAt: '2026-11-23T08:29:17.000Z' },
++        window: { usedRatio: 0.0064, resetAt: '2026-11-16T13:29:17.000Z' },
++        windowLabel: '5h window',
++      },
++      claudeGroup,
++    ],
++    modelResets: {
++      'claude-opus-5-5-high': '2026-11-16T13:56:09.000Z',
++      'gemini-4-carbon-high': '2026-11-16T13:29:17.000Z',
++    },
++  };
++
++  it("returns the gemini forwarder's usage for its models, with the quotas of the model's own group", async () => {
++    const fetchUsage = vi.fn(async () => geminiUsage);
++    const { call } = museRoute({ fetchUsage });
++    const { groups: _groups, modelResets: _modelResets, ...shared } = geminiUsage;
++
++    expect((await call({ model: 'gemini/carbon' })).payload).toEqual({ code: 0, msg: 'success', data: shared });
++    expect((await call({ model: 'gemini/opus' })).payload).toEqual({
++      code: 0,
++      msg: 'success',
++      data: { ...shared, weekly: claudeGroup.weekly, window: claudeGroup.window },
++    });
++    expect(fetchUsage).toHaveBeenCalledWith('https://muse.example.test:8790/v1', 'muse-key');
++  });
++
++  /** Runs the badge script against a page without a model picker and returns the usage pill. */
++  async function usagePill(data: unknown) {
++    const script = (await call(BALANCE_BADGE_SCRIPT_PATH, {})).payload as string;
++    interface Element {
++      id: string;
++      textContent: string;
++      title: string;
++      parentElement: unknown;
++    }
++    const created: Element[] = [];
++    const body = { appendChild: (element: Element) => (element.parentElement = body) };
++    const document = {
++      body,
++      head: { appendChild: () => {} },
++      querySelector: () => null,
++      getElementById: (id: string) => created.find((el) => el.id === id && el.parentElement === body) ?? null,
++      createElement: () => {
++        const element = { id: '', textContent: '', title: '', parentElement: null, classList: { add: () => {}, remove: () => {} } };
++        created.push(element);
++        return element;
++      },
++    };
++    const fetchPage = async (url: string) =>
++      new Response(JSON.stringify({ data: url.startsWith(MUSE_USAGE_API_PATH) ? data : null }));
++    runInNewContext(script, {
++      document,
++      localStorage: { getItem: () => 'web-credential' },
++      location: { pathname: '/' },
++      fetch: fetchPage,
++      MutationObserver: class {
++        observe() {}
++      },
++      setInterval: () => 0,
++      requestAnimationFrame: (callback: () => void) => {
++        callback();
++      },
++    });
++    await new Promise((resolve) => setTimeout(resolve, 0));
++    return created.find((element) => element.id === 'customkimi-muse' && element.parentElement === body) ?? null;
++  }
++
++  it('the badge script names the pill after the forwarder that answered', async () => {
++    const { groups: _groups, modelResets: _modelResets, ...shared } = geminiUsage;
++
++    const gemini = await usagePill(shared);
++    expect(gemini?.textContent).toBe('Gemini  weekly 0% · 5h 1%');
++    expect(gemini?.title).toBe('Gemini subscription usage (agy 1.5.9)');
++
++    const muse = await usagePill(usage);
++    expect(muse?.textContent).toBe('Muse  weekly 1% · 5h 3%');
++    expect(muse?.title).toBe('Muse subscription usage (muse 1.4.13-R6996.1)');
++
++    expect(await usagePill(null)).toBeNull();
++  });
+ });
+diff --git a/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts b/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
+index 8122f8a8790aa5b8faa4f96a9770ad5031e7b61f..f34633dabfb5aaaf67d29e4d8efae3a80e1575f7 100644
+--- a/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
++++ b/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
+@@ -318,6 +318,7 @@ describe('UsagePanelComponent', () => {
+ 
+ describe('Muse usage panel', () => {
+   const museUsage = {
++    name: 'Muse' as const,
+     weekly: { usedRatio: 0.01, resetAt: '2026-11-02T00:00:00.000Z' },
+     window: { usedRatio: 0.03, resetAt: '2026-10-27T18:03:59.000Z' },
+     windowLabel: '5h window',
+@@ -368,7 +369,7 @@ describe('Muse usage panel', () => {
+     expect(buildMuseUsageReportLines({})).toEqual([]);
+   });
+ 
+-  async function runShowUsage(providers: Record<string, unknown>, fetchImpl: () => Promise<Response>) {
++  async function runShowUsage(providers: Record<string, unknown>, fetchImpl: (url: string) => Promise<Response>) {
+     vi.stubGlobal('fetch', vi.fn(fetchImpl));
+     const { showUsage } = await import('#/tui/commands/info');
+     const panels: string[][] = [];
+@@ -437,4 +438,130 @@ describe('Muse usage panel', () => {
+     expect(await runShowUsage({ other: { ...museProvider, apiKeyEnv: 'OTHER_KEY' } }, async () => new Response('{}'))).toHaveLength(1);
+     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+   });
++
++  const geminiGroup = {
++    name: 'Gemini Models',
++    weekly: { usedRatio: 0.02, resetAt: '2026-11-23T08:29:17.000Z' },
++    window: { usedRatio: 0.07, resetAt: '2026-11-16T13:29:17.000Z' },
++    windowLabel: '5h window',
++  };
++  const geminiUsage = {
++    ...geminiGroup,
++    name: 'Gemini' as const,
++    version: '1.5.9',
++    tokens: { input: 19970, output: 81, cached: 0, reasoning: 60 },
++    requests: 2,
++    groups: [
++      geminiGroup,
++      {
++        name: 'Claude and GPT models',
++        weekly: { usedRatio: 0.3, resetAt: '2026-11-23T08:56:09.000Z' },
++        window: { usedRatio: 0.5, resetAt: '2026-11-16T13:56:09.000Z' },
++        windowLabel: '5h window',
++      },
++    ],
++  };
++  const geminiProvider = { ...museProvider, baseUrl: 'https://muse.example.test:8790/v1' };
++  const museReply = {
++    identity: { muse_version: '1.4.13-R6996.1' },
++    subscription: {
++      weekly: { resets_at: 1793577600, used_percent: 1 },
++      window: { resets_at: 1793124239, used_percent: 3, window_duration_mins: 300 },
++    },
++  };
++  const geminiReply = {
++    identity: { agy_version: '1.5.9', email: 'someone@example.test' },
++    subscription: {
++      groups: [
++        {
++          name: 'Gemini Models',
++          buckets: [
++            { resets_at: '2026-11-23T08:29:17Z', used_percent: 2, window: 'weekly' },
++            { resets_at: '2026-11-16T13:29:17Z', used_percent: 7, window: '5h' },
++          ],
++        },
++      ],
++      weekly: { resets_at: '2026-11-23T08:29:17Z', used_percent: 2 },
++      window: { resets_at: '2026-11-16T13:29:17Z', used_percent: 7, window_duration_mins: 300 },
++    },
++  };
++
++  it('renders the quotas of every gemini group under the agy version', () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date('2026-11-16T09:29:17Z'));
++    const lines = buildMuseUsageReportLines({ museUsage: geminiUsage }).map(strip);
++    const output = lines.join('\n');
++
++    expect(lines[0]).toBe('Gemini usage · agy 1.5.9');
++    expect(lines).toHaveLength(6);
++    expect(lines[1]).toContain('Gemini Models weekly');
++    expect(lines[1]).toContain('2% used');
++    expect(lines[2]).toContain('Gemini Models 5h');
++    expect(lines[2]).toContain('7% used');
++    expect(lines[2]).toContain('resets in 4h');
++    expect(lines[3]).toContain('Claude and GPT models weekly');
++    expect(lines[3]).toContain('30% used');
++    expect(lines[4]).toContain('Claude and GPT models 5h');
++    expect(lines[4]).toContain('50% used');
++    expect(output).toContain('2 requests');
++    expect(output).not.toContain('Muse');
++  });
++
++  it('names the forwarder in the heading when its usage could not be read', () => {
++    const lines = buildMuseUsageReportLines({ name: 'Gemini', museUsageError: 'Gemini usage unavailable' });
++
++    expect(lines.map(strip)).toEqual(['Gemini usage', '  Gemini usage unavailable']);
++  });
++
++  it('/usage adds a panel per forwarder when the gemini provider reads the muse key too', async () => {
++    vi.stubEnv('MUSE_FORWARDER_KEY', 'muse-key');
++    const panels = await runShowUsage({ gemini: geminiProvider, muse: museProvider }, async (url) =>
++      new Response(JSON.stringify(url.includes(':8790/') ? geminiReply : museReply)),
++    );
++
++    expect(panels).toHaveLength(3);
++    expect(panels[1]?.[0]).toContain(' Gemini ');
++    expect(panels[1]?.join('\n')).toContain('Gemini usage · agy 1.5.9');
++    expect(panels[1]?.join('\n')).toContain('Gemini Models 5h');
++    expect(panels[1]?.join('\n')).not.toContain('someone@example.test');
++    expect(panels[2]?.[0]).toContain(' Muse ');
++    expect(panels[2]?.join('\n')).toContain('Muse usage · v1.4.13-R6996.1');
++    expect(vi.mocked(fetch).mock.calls.map((call) => call[0])).toEqual([
++      'https://muse.example.test:8790/usage',
++      'https://muse.example.test:8788/usage',
++    ]);
++  });
++
++  it('/usage names the panel after the reply, not after the provider entry', async () => {
++    vi.stubEnv('MUSE_FORWARDER_KEY', 'muse-key');
++    const panels = await runShowUsage({ relay: geminiProvider }, async () => new Response(JSON.stringify(geminiReply)));
++
++    expect(panels).toHaveLength(2);
++    expect(panels[1]?.[0]).toContain(' Gemini ');
++  });
++
++  it('/usage shows "Gemini usage unavailable" for a gemini provider that cannot be read', async () => {
++    vi.stubEnv('MUSE_FORWARDER_KEY', 'muse-key');
++    const panels = await runShowUsage({ muse: museProvider, gemini: geminiProvider }, async (url) => {
++      if (url.includes(':8790/')) throw new Error('offline');
++      return new Response(JSON.stringify(museReply));
++    });
++
++    expect(panels).toHaveLength(3);
++    expect(panels[1]?.join('\n')).toContain('Muse usage · v1.4.13-R6996.1');
++    expect(panels[2]?.[0]).toContain(' Gemini ');
++    expect(panels[2]?.join('\n')).toContain('Gemini usage unavailable');
++  });
++
++  it('/usage reads a provider that names GEMINI_FORWARDER_KEY with that key', async () => {
++    vi.stubEnv('MUSE_FORWARDER_KEY', '');
++    vi.stubEnv('GEMINI_FORWARDER_KEY', 'gemini-key');
++    const providers = { gemini: { ...geminiProvider, apiKeyEnv: 'GEMINI_FORWARDER_KEY' }, muse: museProvider };
++    const panels = await runShowUsage(providers, async () => new Response(JSON.stringify(geminiReply)));
++
++    expect(panels).toHaveLength(2);
++    expect(panels[1]?.[0]).toContain(' Gemini ');
++    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
++    expect(new Headers(vi.mocked(fetch).mock.calls[0]?.[1]?.headers).get('authorization')).toBe('Bearer gemini-key');
++  });
+ });
+diff --git a/apps/kimi-code/test/utils/billing/muse-usage.test.ts b/apps/kimi-code/test/utils/billing/muse-usage.test.ts
+index f3c43fa8f5d6fd252f2c240c4681127c8292b677..7aede0c0a94d23ea2aebbb6c80f5fb2c2361562a 100644
+--- a/apps/kimi-code/test/utils/billing/muse-usage.test.ts
++++ b/apps/kimi-code/test/utils/billing/muse-usage.test.ts
+@@ -1,10 +1,11 @@
+ import { describe, expect, it } from 'vitest';
+ 
+ import {
+-  configuredMuseEndpoint,
++  configuredMuseEndpoints,
+   fetchMuseUsage,
+   isMuseProvider,
+   museEndpoint,
++  museUsageForModel,
+   museUsageUrl,
+   parseMuseUsage,
+   toQuotaRows,
+@@ -31,6 +32,7 @@ const sample = {
+ };
+ 
+ const parsed: MuseUsage = {
++  name: 'Muse',
+   weekly: { usedRatio: 0.01, resetAt: '2026-11-02T00:00:00.000Z' },
+   window: { usedRatio: 0.03, resetAt: '2026-10-27T18:03:59.000Z' },
+   windowLabel: '5h window',
+@@ -39,6 +41,73 @@ const parsed: MuseUsage = {
+   requests: 7,
+ };
+ 
++/** A real reply of the gemini forwarder's GET /usage, with two of its 31 models and another email. */
++const geminiSample = {
++  identity: {
++    account: '96cd042fa3bd',
++    agy_version: '1.5.9',
++    email: 'someone@example.test',
++    project: 'aicode-consumers',
++    tier: 'free-tier',
++  },
++  observed_at: '2026-11-16T09:27:52Z',
++  requests: 2,
++  subscription: {
++    groups: [
++      {
++        name: 'Gemini Models',
++        buckets: [
++          { id: 'gemini-weekly', resets_at: '2026-11-23T08:29:17Z', used_percent: 0.16, window: 'weekly' },
++          { id: 'gemini-5h', resets_at: '2026-11-16T13:29:17Z', used_percent: 0.64, window: '5h' },
++        ],
++      },
++      {
++        name: 'Claude and GPT models',
++        buckets: [
++          { id: '3p-weekly', resets_at: '2026-11-23T08:56:09Z', used_percent: 0.05, window: 'weekly' },
++          { id: '3p-5h', resets_at: '2026-11-16T13:56:09Z', used_percent: 0.09, window: '5h' },
++        ],
++      },
++    ],
++    models: [
++      { model: 'claude-opus-5-5-high', resets_at: '2026-11-16T13:56:09Z', used_percent: 0.09 },
++      { model: 'gemini-4-carbon-high', resets_at: '2026-11-16T13:29:17Z', used_percent: 0.62 },
++    ],
++    tier: 'free-tier',
++    weekly: { bucket: 'gemini-weekly', resets_at: '2026-11-23T08:29:17Z', used_percent: 0.16 },
++    window: { bucket: 'gemini-5h', resets_at: '2026-11-16T13:29:17Z', used_percent: 0.64, window_duration_mins: 300 },
++  },
++  tokens: { cached: 0, input: 19970, output: 81, reasoning: 60 },
++};
++
++const geminiGroup = {
++  name: 'Gemini Models',
++  weekly: { usedRatio: 0.16 / 100, resetAt: '2026-11-23T08:29:17.000Z' },
++  window: { usedRatio: 0.64 / 100, resetAt: '2026-11-16T13:29:17.000Z' },
++  windowLabel: '5h window',
++};
++const claudeGroup = {
++  name: 'Claude and GPT models',
++  weekly: { usedRatio: 0.05 / 100, resetAt: '2026-11-23T08:56:09.000Z' },
++  window: { usedRatio: 0.09 / 100, resetAt: '2026-11-16T13:56:09.000Z' },
++  windowLabel: '5h window',
++};
++
++const geminiParsed: MuseUsage = {
++  name: 'Gemini',
++  weekly: geminiGroup.weekly,
++  window: geminiGroup.window,
++  windowLabel: '5h window',
++  version: '1.5.9',
++  tokens: { input: 19970, output: 81, cached: 0, reasoning: 60 },
++  requests: 2,
++  groups: [geminiGroup, claudeGroup],
++  modelResets: {
++    'claude-opus-5-5-high': '2026-11-16T13:56:09.000Z',
++    'gemini-4-carbon-high': '2026-11-16T13:29:17.000Z',
++  },
++};
++
+ const BASE_URL = 'https://muse.example.test:8788/v1';
+ const USAGE_URL = 'https://muse.example.test:8788/usage';
+ 
+@@ -58,9 +127,10 @@ function routedFetch(reply: (url: string) => Response) {
+ }
+ 
+ describe('isMuseProvider', () => {
+-  it('recognises the provider by its MUSE_FORWARDER_KEY variable', () => {
++  it('recognises a forwarder by the MUSE_FORWARDER_KEY or GEMINI_FORWARDER_KEY variable', () => {
+     expect(isMuseProvider({ type: 'openai_responses', apiKeyEnv: 'MUSE_FORWARDER_KEY' })).toBe(true);
+     expect(isMuseProvider({ apiKeyEnv: 'MUSE_FORWARDER_KEY' })).toBe(true);
++    expect(isMuseProvider({ apiKeyEnv: 'GEMINI_FORWARDER_KEY' })).toBe(true);
+     expect(isMuseProvider({ type: 'openai_responses', apiKeyEnv: 'OPENROUTER_API_KEY' })).toBe(false);
+     expect(isMuseProvider({ type: 'openai_responses' })).toBe(false);
+     expect(isMuseProvider(undefined)).toBe(false);
+@@ -110,6 +180,7 @@ describe('parseMuseUsage', () => {
+       },
+     });
+     expect(usage).toEqual({
++      name: 'Muse',
+       weekly: { usedRatio: 1, resetAt: '2026-11-02T00:00:00.000Z' },
+       window: { usedRatio: 0, resetAt: undefined },
+       windowLabel: '30m window',
+@@ -119,7 +190,7 @@ describe('parseMuseUsage', () => {
+     });
+   });
+ 
+-  it('drops a reset time that is not a UNIX timestamp', () => {
++  it('drops a reset time that is neither a UNIX timestamp nor a date', () => {
+     const usage = parseMuseUsage({
+       subscription: {
+         weekly: { used_percent: 1, resets_at: 'tomorrow' },
+@@ -146,6 +217,71 @@ describe('parseMuseUsage', () => {
+   ])('returns undefined for %s', (_name, json) => {
+     expect(parseMuseUsage(json)).toBeUndefined();
+   });
++
++  it("parses the gemini forwarder's reply: ISO reset times, fractional percentages, groups", () => {
++    expect(parseMuseUsage(geminiSample)).toEqual(geminiParsed);
++  });
++
++  it("keeps nothing of the gemini identity but the agy version", () => {
++    const kept = JSON.stringify(parseMuseUsage(geminiSample));
++    expect(kept).not.toContain('someone@example.test');
++    expect(kept).not.toContain('96cd042fa3bd');
++    expect(kept).not.toContain('aicode-consumers');
++  });
++
++  it('skips a group without a name, a weekly bucket or a second bucket', () => {
++    const [gemini, claude] = geminiSample.subscription.groups;
++    const usage = parseMuseUsage({
++      ...geminiSample,
++      subscription: {
++        ...geminiSample.subscription,
++        groups: [
++          { buckets: gemini?.buckets },
++          { name: 'Weekly only', buckets: [gemini?.buckets[0]] },
++          { name: 'No weekly', buckets: [gemini?.buckets[1]] },
++          { name: 'No buckets' },
++          'not a group',
++          claude,
++        ],
++      },
++    });
++    expect(usage?.groups).toEqual([claudeGroup]);
++  });
++
++  it('has no groups when the reply has none that parse', () => {
++    const usage = parseMuseUsage({ ...geminiSample, subscription: { ...geminiSample.subscription, groups: [] } });
++    expect(usage?.name).toBe('Gemini');
++    expect(usage?.groups).toBeUndefined();
++    expect(usage?.modelResets).toBeUndefined();
++  });
++});
++
++describe('museUsageForModel', () => {
++  const shared = { ...geminiParsed, groups: undefined, modelResets: undefined };
++
++  it("gives a model the quotas of its own group, found by when the model's quota resets", () => {
++    expect(museUsageForModel(geminiParsed, 'claude-opus-5-5-high')).toEqual({
++      ...shared,
++      weekly: claudeGroup.weekly,
++      window: claudeGroup.window,
++    });
++    expect(museUsageForModel(geminiParsed, 'gemini-4-carbon-high')).toEqual(shared);
++  });
++
++  it('ignores an account selector on the model', () => {
++    expect(museUsageForModel(geminiParsed, 'claude-opus-5-5-high@someone').window).toEqual(claudeGroup.window);
++  });
++
++  it('keeps the most used quotas for a model the reply does not list, and drops the group detail', () => {
++    const usage = museUsageForModel(geminiParsed, 'gemini-9-unknown');
++    expect(usage).toEqual(shared);
++    expect(usage).not.toHaveProperty('groups');
++    expect(usage).not.toHaveProperty('modelResets');
++  });
++
++  it('leaves a muse usage as it is', () => {
++    expect(museUsageForModel(parsed, 'muse-wonder-1.0')).toEqual(parsed);
++  });
+ });
+ 
+ describe('fetchMuseUsage', () => {
+@@ -203,6 +339,14 @@ describe('museEndpoint', () => {
+     });
+   });
+ 
++  it('reads the key from the variable the provider names', () => {
++    const gemini = { ...provider, apiKeyEnv: 'GEMINI_FORWARDER_KEY' };
++    const env = { MUSE_FORWARDER_KEY: 'muse-key', GEMINI_FORWARDER_KEY: 'gemini-key' };
++    expect(museEndpoint(gemini, undefined, env)).toEqual({ baseUrl: BASE_URL, key: 'gemini-key' });
++    expect(museEndpoint(provider, undefined, env)).toEqual({ baseUrl: BASE_URL, key: 'muse-key' });
++    expect(museEndpoint(gemini, undefined, { MUSE_FORWARDER_KEY: 'muse-key' })).toBeUndefined();
++  });
++
+   it('is undefined for other providers, without a key, or without a base URL', () => {
+     const env = { MUSE_FORWARDER_KEY: 'muse-key' };
+     expect(museEndpoint(undefined, undefined, env)).toBeUndefined();
+@@ -217,12 +361,31 @@ describe('museEndpoint', () => {
+       openrouter: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1', apiKeyEnv: 'OPENROUTER_API_KEY' },
+       muse: provider,
+     };
+-    expect(configuredMuseEndpoint(providers, { MUSE_FORWARDER_KEY: 'muse-key' })).toEqual({
+-      baseUrl: BASE_URL,
+-      key: 'muse-key',
+-    });
+-    expect(configuredMuseEndpoint(providers, {})).toBeUndefined();
+-    expect(configuredMuseEndpoint({}, { MUSE_FORWARDER_KEY: 'muse-key' })).toBeUndefined();
++    expect(configuredMuseEndpoints(providers, { MUSE_FORWARDER_KEY: 'muse-key' })).toEqual([
++      { baseUrl: BASE_URL, key: 'muse-key', name: 'Muse' },
++    ]);
++    expect(configuredMuseEndpoints(providers, {})).toEqual([]);
++    expect(configuredMuseEndpoints({}, { MUSE_FORWARDER_KEY: 'muse-key' })).toEqual([]);
++  });
++
++  it('finds every forwarder, in order, and guesses gemini from the provider id or its own key variable', () => {
++    const geminiUrl = 'https://muse.example.test:8790/v1';
++    const providers = {
++      gemini: { ...provider, baseUrl: geminiUrl },
++      muse: provider,
++      agy: { ...provider, baseUrl: 'https://agy.example.test/v1', apiKeyEnv: 'GEMINI_FORWARDER_KEY' },
++    };
++    const env = { MUSE_FORWARDER_KEY: 'muse-key', GEMINI_FORWARDER_KEY: 'gemini-key' };
++    expect(configuredMuseEndpoints(providers, env)).toEqual([
++      { baseUrl: geminiUrl, key: 'muse-key', name: 'Gemini' },
++      { baseUrl: BASE_URL, key: 'muse-key', name: 'Muse' },
++      { baseUrl: 'https://agy.example.test/v1', key: 'gemini-key', name: 'Gemini' },
++    ]);
++  });
++
++  it('lists a forwarder once when two providers read the same usage URL', () => {
++    const providers = { muse: provider, 'muse-responses': { ...provider, baseUrl: `${BASE_URL}/` } };
++    expect(configuredMuseEndpoints(providers, { MUSE_FORWARDER_KEY: 'muse-key' })).toHaveLength(1);
+   });
+ });
+ 
+@@ -233,4 +396,13 @@ describe('toQuotaRows', () => {
+       { name: '5h window', usedRatio: 0.03, resetAt: '2026-10-27T18:03:59.000Z' },
+     ]);
+   });
++
++  it('turns the quotas of every group into rows when the usage has groups', () => {
++    expect(toQuotaRows(geminiParsed)).toEqual([
++      { name: 'Gemini Models weekly', ...geminiGroup.weekly },
++      { name: 'Gemini Models 5h', ...geminiGroup.window },
++      { name: 'Claude and GPT models weekly', ...claudeGroup.weekly },
++      { name: 'Claude and GPT models 5h', ...claudeGroup.window },
++    ]);
++  });
+ });
+diff --git a/apps/kimi-code/vitest.config.ts b/apps/kimi-code/vitest.config.ts
+index 53fad2115387a5dd7e19a0d6ae918b2233f33b16..3ae773d21203dc249cf18667e083ccd304e6e00c 100644
+--- a/apps/kimi-code/vitest.config.ts
++++ b/apps/kimi-code/vitest.config.ts
+@@ -16,12 +16,13 @@ export default defineConfig({
+       KIMI_LOG_LEVEL: 'off',
+       // Tests run inside a `kimi` shell inherit the wrapper's provider keys; blank them so
+       // the footer's default billing monitor never polls real balances or reads the Keychain,
+-      // and /usage never asks the muse forwarder.
++      // and /usage never asks the muse or gemini forwarder.
+       CLOSEROUTER_API_KEY: '',
+       SEVENAPI_API_KEY: '',
+       OPENROUTER_API_KEY: '',
+       OPENROUTER_MANAGEMENT_KEY: '',
+       MUSE_FORWARDER_KEY: '',
++      GEMINI_FORWARDER_KEY: '',
+     },
+     include: ['test/**/*.test.ts', 'test/**/*.test.tsx'],
+   },
+-- 
+2.50.1 (Apple Git-155)
+
