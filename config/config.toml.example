@@ -607,3 +607,70 @@ max_output_size = 128000
 capabilities = [ "tool_use", "image_in", "always_thinking" ]
 support_efforts = [ "minimal", "low", "medium", "high", "xhigh", "max" ]
 default_effort = "high"
+
+# The gemini forwarder accepts the muse forwarder's key, so it needs no second secret
+# (api_key_env = "GEMINI_FORWARDER_KEY" works as well when that key is set).
+[providers.gemini]
+type = "openai_responses"
+base_url = "https://65.21.196.107:8790/v1"
+api_key_env = "MUSE_FORWARDER_KEY"
+
+[models."gemini/carbon"]
+provider = "gemini"
+model = "gemini-4-carbon-high"
+display_name = "Gemini 4 Carbon (agy)"
+max_context_size = 1048576
+max_output_size = 262144
+capabilities = [ "tool_use", "image_in", "always_thinking" ]
+support_efforts = [ "low", "medium", "high" ]
+default_effort = "high"
+
+[models."gemini/argon"]
+provider = "gemini"
+model = "gemini-4-argon-high"
+display_name = "Gemini 4 Argon (agy)"
+max_context_size = 1048576
+max_output_size = 65536
+capabilities = [ "tool_use", "image_in", "always_thinking" ]
+support_efforts = [ "low", "medium", "high" ]
+default_effort = "high"
+
+[models."gemini/hydrogen"]
+provider = "gemini"
+model = "gemini-4-hydrogen-high"
+display_name = "Gemini 4 Hydrogen (agy)"
+max_context_size = 1048576
+max_output_size = 262144
+capabilities = [ "tool_use", "image_in", "always_thinking" ]
+support_efforts = [ "low", "medium", "high" ]
+default_effort = "high"
+
+[models."gemini/flash"]
+provider = "gemini"
+model = "gemini-3.8-flash-high"
+display_name = "Gemini 3.8 Flash (agy)"
+max_context_size = 1048576
+max_output_size = 65536
+capabilities = [ "tool_use", "image_in", "always_thinking" ]
+support_efforts = [ "low", "medium", "high" ]
+default_effort = "high"
+
+[models."gemini/opus"]
+provider = "gemini"
+model = "claude-opus-5-5-high"
+display_name = "Claude Opus 5.5 via agy"
+max_context_size = 1000000
+max_output_size = 128000
+capabilities = [ "tool_use", "image_in", "always_thinking" ]
+support_efforts = [ "low", "medium", "high" ]
+default_effort = "high"
+
+[models."gemini/sonnet"]
+provider = "gemini"
+model = "claude-sonnet-5-5-high"
+display_name = "Claude Sonnet 5.5 via agy"
+max_context_size = 1000000
+max_output_size = 128000
+capabilities = [ "tool_use", "image_in", "always_thinking" ]
+support_efforts = [ "low", "medium", "high" ]
+default_effort = "high"
