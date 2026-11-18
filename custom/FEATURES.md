@@ -375,6 +375,28 @@ Not a patch: the gemini provider and its six model aliases are configuration (`c
 
 Tests (apps/kimi-code): the gemini cases in `test/utils/billing/muse-usage.test.ts` (`parseMuseUsage`, `museUsageForModel`, `configuredMuseEndpoints`, `toQuotaRows`), the gemini cases of `Muse usage panel` in `test/tui/components/messages/usage-panel.test.ts`, and in `test/cli/web/balance-badge.test.ts` the gemini route case and `the badge script names the pill after the forwarder that answered`, which runs the browser script against a stub page.
 
+## 16. Gemini filter retry (`0016-…`)
+
+Gemini sometimes refuses a harmless request with `This request was blocked by Gemini's filters. They can occasionally trigger by mistake on safe coding, security, or biology-related queries. Please try rephrasing your prompt. …`. Instead of stopping there, the agent sends a random "continue" prompt and keeps going in the same turn.
+
+- It triggers when the reply is that notice (a short reply, at most 800 characters, containing `blocked by Gemini's filters` or `can occasionally trigger by mistake on safe coding`), when a request fails with an error that contains it, and, on a Gemini model only (alias, provider or model name contains `gemini`), when the provider cuts the reply off with `finishReason=filtered`. A long reply that merely quotes the notice does not count.
+- The prompt is picked from spintax templates, e.g. `Keep at it, please! Continue where you left off.`, `What's going on? Kindly pick it back up from there!`, `You stopped there! Please pick up with the work`.
+- At most 5 retries per turn; the 6th block stops the turn with a warning. The count restarts with the next prompt.
+- Every retry shows `Warning: Gemini's filter blocked the reply; retrying automatically (1/5) with "<prompt>"` in the main conversation (CLI and web). The prompt is saved in the history with origin `system_trigger` / `gemini_filter_retry`, so the transcript does not show it as a user message. Subagent warnings are not drawn in the subagent's card yet.
+- Subagents retry inside their own run, so the parent receives the real answer, not the notice.
+- Setting: top-level `gemini_filter_retry` in `config.toml`: `true` (default, every agent), `"subagents"` (subagents only; the main conversation stops on the notice) or `false` (off). `/settings` → **Gemini filter retry** offers On / Subagents only / Off and writes it; a change applies to running sessions at the next step.
+
+Code:
+
+- `packages/agent-core-v2/src/features/geminiFilterRetry/`: `geminiFilterRetry.ts` (config section `geminiFilterRetry`, notice detection, `geminiFilterRetryAppliesTo()`, spintax), `geminiFilterRetryService.ts` (agent service), `geminiFilterRetryFeature.ts`; registered in `src/index.ts`; `docs/config-manifest.toml` regenerated.
+  - A blocked **reply** is handled in an `onDidFinishStep` hook: the service calls `IAgentLoopService.notify()` with the continue message (turn-scoped), which keeps the turn running.
+  - A failed **request** is handled through `IAgentLoopService.registerLlmRecovery()`: the turn machine's recovery proposal re-runs the step (before its plain same-request retries), and the loop appends the continue message after it closes the failed step. v2 builds every request from context memory, so a recovery cannot use `attemptMessageOverride`; it returns `appendMessages` instead.
+- `packages/agent-core-v2/src/agent/loop/loop.ts`, `loopService.ts`: the `registerLlmRecovery` seam (`LoopLlmRecovery`, passed to the machine engine as `recovery`, appended on the `recovering` event). `turn.filtered` now follows the last step, and a live nudge keeps a filtered step from failing the turn.
+- `packages/node-sdk/src/config/schema.ts`, `config/toml.ts`, `v2/config-mapper.ts`, `packages/kap-server/src/protocol/rest-config.ts`: the `geminiFilterRetry` / `gemini_filter_retry` key (`boolean | "subagents"`).
+- `apps/kimi-code/src/tui/components/dialogs/settings-selector.ts`, `gemini-filter-retry-selector.ts`, `src/tui/commands/config.ts` (`showGeminiFilterRetryPicker`, `applyGeminiFilterRetryChoice`).
+
+Tests: `packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry.test.ts` (detection, spintax, a blocked reply, a failed request, both 5-retry caps, a real subagent run through `runAgentTurn`, subagents-only mode, off), `apps/kimi-code/test/tui/commands/gemini-filter-retry-preferences.test.ts`; `loop/stubs.ts`, `toolSelectService.test.ts` and `subagentScopeCache.test.ts` gained `registerLlmRecovery`.
+
 ## When a patch conflicts
 
 `update.sh` stops, leaves the new release in `source.next` with the patch half-applied, and keeps your current `kimi` running.

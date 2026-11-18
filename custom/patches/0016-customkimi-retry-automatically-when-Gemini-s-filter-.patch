@@ -1,0 +1,1218 @@
+From f342455148dc3096ce6154b45f1e45e89c0bb8a1 Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Wed, 18 Nov 2026 23:12:00 +0700
+Subject: [PATCH 16/16] customkimi: retry automatically when Gemini's filter
+ blocks a reply
+
+When a reply is Gemini's block notice ("This request was blocked by
+Gemini's filters ...") or a request fails with it, the agent sends a
+random spintax "continue" prompt and keeps going inside the same turn,
+up to 5 times in a row; then it stops with a warning. On a Gemini model
+a reply cut off by the provider's filter (finishReason=filtered) counts
+too. Every retry shows a warning line with the prompt it sent.
+
+It runs in the main agent and in subagents. A subagent retries inside
+its own run, so the parent receives the real answer. The new top-level
+setting gemini_filter_retry chooses who retries: true (all agents, the
+default), "subagents" (subagents only) or false (off). /settings has a
+"Gemini filter retry" entry with On / Subagents only / Off.
+
+A blocked reply is continued with a turn-scoped loop nudge from the
+onDidFinishStep hook. A failed request goes through a new
+IAgentLoopService.registerLlmRecovery seam: the turn machine's recovery
+proposal re-runs the step, and the loop appends the continue message to
+context after closing the failed step, since v2 builds requests from
+context memory. A live nudge now also keeps a filtered step from
+failing the turn, and turn.filtered follows the last step.
+---
+ apps/kimi-code/src/tui/commands/config.ts     |  66 ++++
+ .../dialogs/gemini-filter-retry-selector.ts   |  52 +++
+ .../components/dialogs/settings-selector.ts   |   7 +
+ .../gemini-filter-retry-preferences.test.ts   |  63 ++++
+ .../agent-core-v2/docs/config-manifest.toml   |  11 +-
+ packages/agent-core-v2/src/agent/loop/loop.ts |  28 +-
+ .../src/agent/loop/loopService.ts             |  43 ++-
+ .../geminiFilterRetry/geminiFilterRetry.ts    | 102 ++++++
+ .../geminiFilterRetryFeature.ts               |  17 +
+ .../geminiFilterRetryService.ts               | 162 ++++++++++
+ packages/agent-core-v2/src/index.ts           |   3 +
+ .../agent-core-v2/test/agent/loop/stubs.ts    |   1 +
+ .../toolSelect/toolSelectService.test.ts      |   4 +
+ .../geminiFilterRetry.test.ts                 | 300 ++++++++++++++++++
+ .../subagent/subagentScopeCache.test.ts       |   1 +
+ .../kap-server/src/protocol/rest-config.ts    |   2 +
+ packages/node-sdk/src/config/schema.ts        |   2 +
+ packages/node-sdk/src/config/toml.ts          |   1 +
+ packages/node-sdk/src/v2/config-mapper.ts     |   1 +
+ 19 files changed, 862 insertions(+), 4 deletions(-)
+ create mode 100644 apps/kimi-code/src/tui/components/dialogs/gemini-filter-retry-selector.ts
+ create mode 100644 apps/kimi-code/test/tui/commands/gemini-filter-retry-preferences.test.ts
+ create mode 100644 packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetry.ts
+ create mode 100644 packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryFeature.ts
+ create mode 100644 packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryService.ts
+ create mode 100644 packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry.test.ts
+
+diff --git a/apps/kimi-code/src/tui/commands/config.ts b/apps/kimi-code/src/tui/commands/config.ts
+index 5ba92a45a0ccfa9db3d7a271e48010f266ec74a3..def79a9fa6beea721d17b55cb113fd1658aee1b8 100644
+--- a/apps/kimi-code/src/tui/commands/config.ts
++++ b/apps/kimi-code/src/tui/commands/config.ts
+@@ -11,6 +11,10 @@ import {
+ 
+ import { EditorSelectorComponent } from '../components/dialogs/editor-selector';
+ import { EffortSelectorComponent } from '../components/dialogs/effort-selector';
++import {
++  GeminiFilterRetrySelectorComponent,
++  type GeminiFilterRetryMode,
++} from '../components/dialogs/gemini-filter-retry-selector';
+ import {
+   ExperimentsSelectorComponent,
+   type ExperimentalFeatureDraftChange,
+@@ -917,6 +921,67 @@ export async function applySurveyPreferenceChoice(
+   host.showStatus(`Feedback survey ${enabled ? 'enabled' : 'disabled'}.`);
+ }
+ 
++type GeminiFilterRetryHost = {
++  readonly harness: {
++    getConfig(): Promise<{ readonly geminiFilterRetry?: GeminiFilterRetryMode }>;
++    setConfig(patch: { geminiFilterRetry: GeminiFilterRetryMode }): Promise<unknown>;
++  };
++  showStatus(msg: string, color?: string): void;
++};
++
++function geminiFilterRetryModeOf(value: GeminiFilterRetryMode | undefined): GeminiFilterRetryMode {
++  if (value === false || value === 'subagents') return value;
++  return true;
++}
++
++function describeGeminiFilterRetryMode(mode: GeminiFilterRetryMode): string {
++  if (mode === 'subagents') return 'on for subagents only';
++  return mode ? 'on for all agents' : 'off';
++}
++
++export async function showGeminiFilterRetryPicker(host: SlashCommandHost): Promise<void> {
++  let currentValue: GeminiFilterRetryMode;
++  try {
++    currentValue = geminiFilterRetryModeOf((await host.harness.getConfig()).geminiFilterRetry);
++  } catch (error) {
++    host.showError(`Failed to load the Gemini filter retry setting: ${formatErrorMessage(error)}`);
++    return;
++  }
++  host.mountEditorReplacement(
++    new GeminiFilterRetrySelectorComponent({
++      currentValue,
++      onSelect: (value) => {
++        host.restoreEditor();
++        void applyGeminiFilterRetryChoice(host, value);
++      },
++      onCancel: () => {
++        host.restoreEditor();
++      },
++    }),
++  );
++}
++
++export async function applyGeminiFilterRetryChoice(
++  host: GeminiFilterRetryHost,
++  mode: GeminiFilterRetryMode,
++): Promise<void> {
++  try {
++    const current = geminiFilterRetryModeOf((await host.harness.getConfig()).geminiFilterRetry);
++    if (current === mode) {
++      host.showStatus(`Gemini filter retry already ${describeGeminiFilterRetryMode(mode)}.`);
++      return;
++    }
++    await host.harness.setConfig({ geminiFilterRetry: mode });
++  } catch (error) {
++    host.showStatus(
++      `Failed to save the Gemini filter retry setting: ${formatErrorMessage(error)}`,
++      'error',
++    );
++    return;
++  }
++  host.showStatus(`Gemini filter retry ${describeGeminiFilterRetryMode(mode)}.`, 'success');
++}
++
+ export function showMermaidPreferencePicker(host: SlashCommandHost): void {
+   host.mountEditorReplacement(
+     new MermaidPreferenceSelectorComponent({
+@@ -1049,6 +1114,7 @@ function handleSettingsSelection(host: SlashCommandHost, value: SettingsSelectio
+     case 'survey': showSurveyPreferencePicker(host); return;
+     case 'experiments': void showExperimentsPanel(host); return;
+     case 'upgrade': showUpdatePreferencePicker(host); return;
++    case 'geminiFilterRetry': void showGeminiFilterRetryPicker(host); return;
+     case 'usage': void showUsage(host); return;
+   }
+ }
+diff --git a/apps/kimi-code/src/tui/components/dialogs/gemini-filter-retry-selector.ts b/apps/kimi-code/src/tui/components/dialogs/gemini-filter-retry-selector.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..20a39cf3eebc536ee9f48a31d0cb4a694524521a
+--- /dev/null
++++ b/apps/kimi-code/src/tui/components/dialogs/gemini-filter-retry-selector.ts
+@@ -0,0 +1,52 @@
++import { ChoicePickerComponent, type ChoiceOption } from './choice-picker';
++
++export type GeminiFilterRetryMode = boolean | 'subagents';
++
++const GEMINI_FILTER_RETRY_OPTIONS: readonly ChoiceOption[] = [
++  {
++    value: 'on',
++    label: 'On',
++    description:
++      "When Gemini's filter blocks a reply, the main agent and every subagent send a random \"continue\" prompt automatically (up to 5 times in a row).",
++  },
++  {
++    value: 'subagents',
++    label: 'Subagents only',
++    description: 'Subagents retry on their own; the main conversation stops on the block notice and waits for you.',
++  },
++  {
++    value: 'off',
++    label: 'Off',
++    description: 'Every agent stops on the block notice.',
++  },
++];
++
++function choiceOf(mode: GeminiFilterRetryMode): string {
++  if (mode === 'subagents') return 'subagents';
++  return mode ? 'on' : 'off';
++}
++
++function modeOf(choice: string): GeminiFilterRetryMode {
++  if (choice === 'subagents') return 'subagents';
++  return choice === 'on';
++}
++
++export interface GeminiFilterRetrySelectorOptions {
++  readonly currentValue: GeminiFilterRetryMode;
++  readonly onSelect: (value: GeminiFilterRetryMode) => void;
++  readonly onCancel: () => void;
++}
++
++export class GeminiFilterRetrySelectorComponent extends ChoicePickerComponent {
++  constructor(opts: GeminiFilterRetrySelectorOptions) {
++    super({
++      title: 'Gemini filter retry',
++      options: [...GEMINI_FILTER_RETRY_OPTIONS],
++      currentValue: choiceOf(opts.currentValue),
++      onSelect: (value) => {
++        opts.onSelect(modeOf(value));
++      },
++      onCancel: opts.onCancel,
++    });
++  }
++}
+diff --git a/apps/kimi-code/src/tui/components/dialogs/settings-selector.ts b/apps/kimi-code/src/tui/components/dialogs/settings-selector.ts
+index ec0e3c950fef66c1b6fa39ad6b532cc5f2bc4ca5..effe483c046b41ed821005b9d6d2f92c5e9ea2ce 100644
+--- a/apps/kimi-code/src/tui/components/dialogs/settings-selector.ts
++++ b/apps/kimi-code/src/tui/components/dialogs/settings-selector.ts
+@@ -10,6 +10,7 @@ export type SettingsSelection =
+   | 'survey'
+   | 'experiments'
+   | 'upgrade'
++  | 'geminiFilterRetry'
+   | 'usage';
+ 
+ const SETTINGS_OPTIONS: readonly ChoiceOption[] = [
+@@ -58,6 +59,11 @@ const SETTINGS_OPTIONS: readonly ChoiceOption[] = [
+     label: 'Automatic updates',
+     description: 'Turn automatic CLI updates on or off.',
+   },
++  {
++    value: 'geminiFilterRetry',
++    label: 'Gemini filter retry',
++    description: "Auto-send a \"continue\" prompt when Gemini's filter blocks a reply: all agents, subagents only, or off.",
++  },
+   {
+     value: 'usage',
+     label: 'Usage',
+@@ -76,6 +82,7 @@ function isSettingsSelection(value: string): value is SettingsSelection {
+     value === 'survey' ||
+     value === 'experiments' ||
+     value === 'upgrade' ||
++    value === 'geminiFilterRetry' ||
+     value === 'usage'
+   );
+ }
+diff --git a/apps/kimi-code/test/tui/commands/gemini-filter-retry-preferences.test.ts b/apps/kimi-code/test/tui/commands/gemini-filter-retry-preferences.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..331c269acb0e650d0223e128f87588293503f0cf
+--- /dev/null
++++ b/apps/kimi-code/test/tui/commands/gemini-filter-retry-preferences.test.ts
+@@ -0,0 +1,63 @@
++import { describe, expect, it, vi } from 'vitest';
++
++import { applyGeminiFilterRetryChoice } from '#/tui/commands/config';
++
++function makeHost(geminiFilterRetry: boolean | 'subagents' | undefined) {
++  return {
++    harness: {
++      getConfig: vi.fn(async () => ({ geminiFilterRetry })),
++      setConfig: vi.fn(async () => ({})),
++    },
++    showStatus: vi.fn(),
++  };
++}
++
++describe('gemini filter retry preference', () => {
++  it('treats a missing setting as on and saves the opt-out to config.toml', async () => {
++    const host = makeHost(undefined);
++
++    await applyGeminiFilterRetryChoice(host, false);
++
++    expect(host.harness.setConfig).toHaveBeenCalledWith({ geminiFilterRetry: false });
++    expect(host.showStatus).toHaveBeenCalledWith('Gemini filter retry off.', 'success');
++  });
++
++  it('limits the retry to subagents', async () => {
++    const host = makeHost(true);
++
++    await applyGeminiFilterRetryChoice(host, 'subagents');
++
++    expect(host.harness.setConfig).toHaveBeenCalledWith({ geminiFilterRetry: 'subagents' });
++    expect(host.showStatus).toHaveBeenCalledWith('Gemini filter retry on for subagents only.', 'success');
++  });
++
++  it('turns the retry back on for all agents', async () => {
++    const host = makeHost('subagents');
++
++    await applyGeminiFilterRetryChoice(host, true);
++
++    expect(host.harness.setConfig).toHaveBeenCalledWith({ geminiFilterRetry: true });
++    expect(host.showStatus).toHaveBeenCalledWith('Gemini filter retry on for all agents.', 'success');
++  });
++
++  it('does not rewrite the config when the value is unchanged', async () => {
++    const host = makeHost('subagents');
++
++    await applyGeminiFilterRetryChoice(host, 'subagents');
++
++    expect(host.harness.setConfig).not.toHaveBeenCalled();
++    expect(host.showStatus).toHaveBeenCalledWith('Gemini filter retry already on for subagents only.');
++  });
++
++  it('reports a save failure', async () => {
++    const host = makeHost(true);
++    host.harness.setConfig.mockRejectedValueOnce(new Error('disk full'));
++
++    await applyGeminiFilterRetryChoice(host, false);
++
++    expect(host.showStatus).toHaveBeenCalledWith(
++      'Failed to save the Gemini filter retry setting: disk full',
++      'error',
++    );
++  });
++});
+diff --git a/packages/agent-core-v2/docs/config-manifest.toml b/packages/agent-core-v2/docs/config-manifest.toml
+index 7ae6f7d121d0bcd0b50ae93c3f33c44ea3bb47f3..ea522ca848187729f087ad8a88c9bb05641ed199 100644
+--- a/packages/agent-core-v2/docs/config-manifest.toml
++++ b/packages/agent-core-v2/docs/config-manifest.toml
+@@ -8,7 +8,7 @@
+ # commented "# field: type" lines describe the remaining schema fields.
+ # Values resolve as: default -> config.toml -> env overlay -> memory.
+ 
+-# Index (29 sections · 2 overlay(s))
++# Index (30 sections · 2 overlay(s))
+ #   background               src/agent/task/configSection.ts
+ #   builtinProductSkills     src/features/skill/catalog/configSection.ts
+ #   cron                     src/features/cron/configSection.ts
+@@ -18,6 +18,7 @@
+ #   experimental             src/app/flag/flag.ts
+ #   extraAgentDirs           src/workspace/workspaceAgentProfileLoader/configSection.ts
+ #   extraSkillDirs           src/features/skill/catalog/configSection.ts
++#   geminiFilterRetry        src/features/geminiFilterRetry/geminiFilterRetry.ts
+ #   hooks                    src/features/externalHooks/configSection.ts
+ #   identity                 src/app/agentIdentity/configSection.ts
+ #   image                    src/agent/media/configSection.ts
+@@ -159,6 +160,14 @@ extra_agent_dirs = []
+ 
+ extra_skill_dirs = []
+ 
++# ##########################################################################
++# geminiFilterRetry (config.toml: gemini_filter_retry)
++#   owner: src/features/geminiFilterRetry/geminiFilterRetry.ts
++#   scope: core
++# ##########################################################################
++
++gemini_filter_retry = true
++
+ # ##########################################################################
+ # hooks
+ #   owner: src/features/externalHooks/configSection.ts
+diff --git a/packages/agent-core-v2/src/agent/loop/loop.ts b/packages/agent-core-v2/src/agent/loop/loop.ts
+index 7a28b48848cdb84634378c25d850b7e2605d3533..b94b444a9ffdbd42d34e84ea4ddabd14c2208c40 100644
+--- a/packages/agent-core-v2/src/agent/loop/loop.ts
++++ b/packages/agent-core-v2/src/agent/loop/loop.ts
+@@ -3,7 +3,7 @@ import type { IDisposable } from '#/_base/di/lifecycle';
+ import { Error2, isError2, type Error2Options } from '#/_base/errors/errors';
+ import type { ContextMessage } from '#/agent/contextMemory/types';
+ import type { FinishReason } from '#human/llm/finish-reason';
+-import type { ContentPart, TextPart } from '#human/llm/message';
++import type { ContentPart, Message, TextPart } from '#human/llm/message';
+ import type { TokenUsage } from '#human/llm/usage';
+ import type { Hooks } from '#/hooks';
+ import type { UserEntry } from '#human/agent/turn';
+@@ -93,6 +93,30 @@ export interface LoopErrorHandler {
+   handle(context: LoopErrorContext): Promise<boolean | undefined>;
+ }
+ 
++export interface LoopLlmRecoveryRecord {
++  readonly strategy: string;
++  readonly action: string;
++}
++
++export interface LoopLlmRecoveryContext {
++  readonly error: {
++    readonly kind: string;
++    readonly message: string;
++    readonly finishReason?: string | null;
++  };
++  readonly messages: readonly Message[];
++  readonly appliedRecoveries: readonly LoopLlmRecoveryRecord[];
++}
++
++export interface LoopLlmRecoveryProposal extends LoopLlmRecoveryRecord {
++  readonly appendMessages?: readonly ContextMessage[];
++}
++
++export interface LoopLlmRecovery {
++  readonly id: string;
++  propose(context: LoopLlmRecoveryContext): LoopLlmRecoveryProposal | undefined;
++}
++
+ export interface LoopErrorHandlerRegistrationOptions {
+   readonly before?: string;
+   readonly after?: string;
+@@ -232,6 +256,8 @@ export interface IAgentLoopService {
+     options?: LoopErrorHandlerRegistrationOptions,
+   ): IDisposable;
+ 
++  registerLlmRecovery(recovery: LoopLlmRecovery): IDisposable;
++
+   readonly hooks: Hooks<{
+     onWillBeginStep: BeforeStepContext;
+     onDidFinishStep: AfterStepContext;
+diff --git a/packages/agent-core-v2/src/agent/loop/loopService.ts b/packages/agent-core-v2/src/agent/loop/loopService.ts
+index 700fc29ee89dd81ebeb822e7cfc3a151ab92599c..6e34ca226b77b9deb4fca01ab743ead4aab4c8b9 100644
+--- a/packages/agent-core-v2/src/agent/loop/loopService.ts
++++ b/packages/agent-core-v2/src/agent/loop/loopService.ts
+@@ -71,6 +71,9 @@ import {
+   type LoopErrorContext,
+   type LoopErrorHandler,
+   type LoopErrorHandlerRegistrationOptions,
++  type LoopLlmRecovery,
++  type LoopLlmRecoveryContext,
++  type LoopLlmRecoveryProposal,
+   type LoopNotify,
+   type LoopNotifyHandle,
+   type LoopRunResult,
+@@ -140,6 +143,8 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+   };
+ 
+   private readonly errorHandlers: LoopErrorHandler[] = [];
++  private readonly llmRecoveries: LoopLlmRecovery[] = [];
++  private pendingRecoveryMessages: readonly ContextMessage[] = [];
+   private readonly promptWaiters = new Map<string, PromptWaiter>();
+   private readonly steered = new Map<string, SteeredPrompt>();
+   private readonly terminalStates = new Map<string, PromptState>();
+@@ -219,6 +224,9 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+               step: this.active.gatedSteps,
+             },
+       gate: (signal) => this.gate(signal),
++      recovery: {
++        propose: (context) => this.proposeLlmRecovery(context),
++      },
+       promptGate: (queueItemId, message) => this.runPromptGate(queueItemId, message),
+       onTrace: (trace) => {
+         this.activeRequestTrace = trace;
+@@ -963,6 +971,34 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+     });
+   }
+ 
++  registerLlmRecovery(recovery: LoopLlmRecovery): IDisposable {
++    this.deleteLlmRecovery(recovery.id);
++    this.llmRecoveries.push(recovery);
++    return toDisposable(() => {
++      this.deleteLlmRecovery(recovery.id);
++    });
++  }
++
++  private deleteLlmRecovery(id: string): void {
++    const index = this.llmRecoveries.findIndex((entry) => entry.id === id);
++    if (index >= 0) this.llmRecoveries.splice(index, 1);
++  }
++
++  private proposeLlmRecovery(
++    context: LoopLlmRecoveryContext,
++  ): Pick<LoopLlmRecoveryProposal, 'strategy' | 'action'> | undefined {
++    for (const recovery of this.llmRecoveries) {
++      try {
++        const proposal = recovery.propose(context);
++        if (proposal === undefined) continue;
++        this.pendingRecoveryMessages = proposal.appendMessages ?? [];
++        return { strategy: proposal.strategy, action: proposal.action };
++      } catch {
++      }
++    }
++    return undefined;
++  }
++
+   private deleteErrorHandler(id: string): boolean {
+     const index = this.errorHandlers.findIndex((entry) => entry.id === id);
+     if (index < 0) return false;
+@@ -1576,11 +1612,14 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+       case 'recovering': {
+         const turn = this.active;
+         const step = turn?.current;
++        const recoveryMessages = this.pendingRecoveryMessages;
++        this.pendingRecoveryMessages = [];
+         if (turn === undefined) return;
+         if (step !== undefined) {
+           this.closeFailedMachineStep(turn, step, 'error');
+         }
+         turn.current = undefined;
++        for (const message of recoveryMessages) this.materializeMessage(message);
+         return;
+       }
+       case 'retrying': {
+@@ -1877,7 +1916,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+     }
+     turn.interruptStep = undefined;
+     if (context.stopTurn) turn.stopRequested = true;
+-    if (finishReason === 'filtered') turn.filtered = true;
++    turn.filtered = finishReason === 'filtered';
+   }
+ 
+   private async evaluateSettle(
+@@ -1902,7 +1941,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+       await this.endTurn(turn, { type: 'cancelled', steps: turn.steps, reason });
+       return;
+     }
+-    if (turn.filtered) {
++    if (turn.filtered && !this.hasLiveNudge()) {
+       await this.endTurn(turn, {
+         type: 'failed',
+         steps: turn.steps,
+diff --git a/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetry.ts b/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetry.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2557cca8672a5ee49297a1d41c3050e01cf3dd88
+--- /dev/null
++++ b/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetry.ts
+@@ -0,0 +1,102 @@
++import { z } from 'zod';
++
++import type { SystemTriggerOrigin } from '#/agent/contextMemory/types';
++import { registerConfigSection } from '#/app/config/configSectionContributions';
++
++export const GEMINI_FILTER_RETRY_SECTION = 'geminiFilterRetry';
++
++export const GEMINI_FILTER_RETRY_SUBAGENTS_ONLY = 'subagents';
++
++export const GeminiFilterRetryConfigSchema = z
++  .union([z.boolean(), z.literal(GEMINI_FILTER_RETRY_SUBAGENTS_ONLY)])
++  .optional();
++
++export type GeminiFilterRetryConfig = z.infer<typeof GeminiFilterRetryConfigSchema>;
++
++export function geminiFilterRetryAppliesTo(mode: GeminiFilterRetryConfig, mainAgent: boolean): boolean {
++  if (mode === false) return false;
++  if (mode === GEMINI_FILTER_RETRY_SUBAGENTS_ONLY) return !mainAgent;
++  return true;
++}
++
++registerConfigSection(GEMINI_FILTER_RETRY_SECTION, GeminiFilterRetryConfigSchema, {
++  defaultValue: true,
++});
++
++export const GEMINI_FILTER_RETRY_MAX_ATTEMPTS = 5;
++
++export const GEMINI_FILTER_RETRY_STRATEGY = 'gemini_filter_retry';
++
++export const GEMINI_FILTER_RETRY_ORIGIN: SystemTriggerOrigin = {
++  kind: 'system_trigger',
++  name: 'gemini_filter_retry',
++};
++
++export function isGeminiFilterRetryOrigin(origin: { readonly kind: string; readonly name?: unknown } | undefined): boolean {
++  return origin?.kind === GEMINI_FILTER_RETRY_ORIGIN.kind && origin.name === GEMINI_FILTER_RETRY_ORIGIN.name;
++}
++
++const BLOCK_NOTICE_PATTERNS: readonly RegExp[] = [
++  /blocked by gemini\W{0,2}s\s+filters/i,
++  /can occasionally trigger by mistake on safe coding/i,
++];
++
++const MAX_BLOCK_REPLY_LENGTH = 800;
++
++export function containsGeminiBlockNotice(text: string): boolean {
++  return BLOCK_NOTICE_PATTERNS.some((pattern) => pattern.test(text));
++}
++
++export function isGeminiBlockReply(text: string): boolean {
++  const trimmed = text.trim();
++  return trimmed.length > 0 && trimmed.length <= MAX_BLOCK_REPLY_LENGTH && containsGeminiBlockNotice(trimmed);
++}
++
++export function isGeminiModelName(...names: readonly (string | undefined)[]): boolean {
++  return names.some((name) => name !== undefined && /gemini/i.test(name));
++}
++
++export interface GeminiBlockErrorShape {
++  readonly kind?: string;
++  readonly message: string;
++  readonly finishReason?: string | null;
++}
++
++export function isGeminiBlockError(error: GeminiBlockErrorShape | undefined, geminiModel: boolean): boolean {
++  if (error === undefined) return false;
++  if (containsGeminiBlockNotice(error.message)) return true;
++  if (!geminiModel) return false;
++  return (
++    (error.kind === 'empty_response' && error.finishReason === 'filtered') ||
++    /finishReason=filtered\b/.test(error.message)
++  );
++}
++
++const CONTINUE_SPINTAX: readonly string[] = [
++  '{Please|Kindly|Ok,|Alright,|Okay,} {continue|carry on|keep going|go on|proceed|resume}{ where you left off| from where you stopped| with the task| with what you were doing|}{.|!|}',
++  "{What's going on|What happened|Hmm, what happened there|Looks like you stopped|Something interrupted you}{?|...} {Please|Kindly|} {continue|carry on|keep going|resume|pick it back up}{ where you left off| with the task| from there|}{.|!|}",
++  '{Continue|Keep going|Carry on|Go ahead and continue|Resume}{ please|}{ where you left off| with the task|}{.|!|}',
++  '{You stopped|Your reply got cut off|That got interrupted|The last reply did not come through}{ there|}{.|!} {Please|} {continue|pick up|carry on|keep going}{ where you left off| from there| with the work|}{.|}',
++  '{Go on|Keep at it|Carry on}{, please|}{.|!} {Continue|Proceed} {with the next step|with the task|where you left off}{.|}',
++];
++
++export function expandSpintax(template: string, random: () => number = Math.random): string {
++  const group = /\{([^{}]*)\}/;
++  let out = template;
++  for (let match = group.exec(out); match !== null; match = group.exec(out)) {
++    const options = (match[1] ?? '').split('|');
++    const pick = options[Math.min(options.length - 1, Math.floor(random() * options.length))] ?? '';
++    out = out.slice(0, match.index) + pick + out.slice(match.index + match[0].length);
++  }
++  return out
++    .replaceAll(/\s+/g, ' ')
++    .replaceAll(/\s+([.!?,])/g, '$1')
++    .replaceAll(/,([.!?])/g, '$1')
++    .trim()
++    .replaceAll(/(^|[.!?]\s+)([a-z])/g, (_match: string, lead: string, letter: string) => lead + letter.toUpperCase());
++}
++
++export function geminiFilterRetryPrompt(random: () => number = Math.random): string {
++  const index = Math.min(CONTINUE_SPINTAX.length - 1, Math.floor(random() * CONTINUE_SPINTAX.length));
++  return expandSpintax(CONTINUE_SPINTAX[index] ?? CONTINUE_SPINTAX[0] ?? 'Please continue.', random);
++}
+diff --git a/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryFeature.ts b/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryFeature.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b779f46b91f74965f00550f5d087f15cca92f843
+--- /dev/null
++++ b/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryFeature.ts
+@@ -0,0 +1,17 @@
++import { Feature } from '#/features/feature';
++import { registerFeature } from '#/features/featureRegistry';
++import {
++  AgentGeminiFilterRetryService,
++  IAgentGeminiFilterRetryService,
++} from '#/features/geminiFilterRetry/geminiFilterRetryService';
++
++export class GeminiFilterRetryFeature extends Feature {
++  static override readonly name = 'geminiFilterRetry';
++
++  constructor() {
++    super();
++    this.contributeAgentService(IAgentGeminiFilterRetryService, AgentGeminiFilterRetryService);
++  }
++}
++
++registerFeature(GeminiFilterRetryFeature);
+diff --git a/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryService.ts b/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryService.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..633c3b8fa9b7d91004de6a5a1601ee9b9a0217a0
+--- /dev/null
++++ b/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryService.ts
+@@ -0,0 +1,162 @@
++import { createDecorator } from '#/_base/di/instantiation';
++import { Service } from '#/_base/di/service';
++import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
++import type { ContextMessage } from '#/agent/contextMemory/types';
++import {
++  IAgentLoopService,
++  type AfterStepContext,
++  type LoopLlmRecoveryContext,
++  type LoopLlmRecoveryProposal,
++} from '#/agent/loop/loop';
++import { TurnStarted } from '#/agent/loop/turnEvents';
++import { IAgentProfileService } from '#/agent/profile/profile';
++import { WarningIssued } from '#/agent/profile/profileOps';
++import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
++import { IConfigService } from '#/app/config/config';
++import { IEventBus } from '#/app/event/eventBus';
++import { IModelCatalog } from '#/llm-adapter/model/catalog';
++import { MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
++import { IEventDispatcher } from '#/state/eventDispatcher';
++
++import {
++  GEMINI_FILTER_RETRY_MAX_ATTEMPTS,
++  GEMINI_FILTER_RETRY_ORIGIN,
++  GEMINI_FILTER_RETRY_SECTION,
++  GEMINI_FILTER_RETRY_STRATEGY,
++  type GeminiFilterRetryConfig,
++  geminiFilterRetryAppliesTo,
++  geminiFilterRetryPrompt,
++  isGeminiBlockError,
++  isGeminiBlockReply,
++  isGeminiModelName,
++} from './geminiFilterRetry';
++
++export interface IAgentGeminiFilterRetryService {
++  readonly _serviceBrand: undefined;
++}
++
++export const IAgentGeminiFilterRetryService = createDecorator<IAgentGeminiFilterRetryService>(
++  'agentGeminiFilterRetryService',
++);
++
++function lastAssistantBlockReply(history: readonly ContextMessage[]): boolean {
++  const last = history.at(-1);
++  if (last?.role !== 'assistant' || last.toolCalls.length > 0) return false;
++  return isGeminiBlockReply(
++    last.content.map((part) => (part.type === 'text' ? part.text : '')).join(''),
++  );
++}
++
++function retryMessage(prompt: string): ContextMessage {
++  return {
++    role: 'user',
++    content: [{ type: 'text', text: prompt }],
++    toolCalls: [],
++    origin: GEMINI_FILTER_RETRY_ORIGIN,
++  };
++}
++
++export class AgentGeminiFilterRetryService extends Service implements IAgentGeminiFilterRetryService {
++  declare readonly _serviceBrand: undefined;
++
++  private attemptsInTurn = 0;
++  private gaveUpInTurn = false;
++
++  constructor(
++    @IEventBus eventBus: IEventBus,
++    @IAgentScopeContext private readonly scopeContext: IAgentScopeContext,
++    @IAgentLoopService private readonly loop: IAgentLoopService,
++    @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
++    @IAgentProfileService private readonly profile: IAgentProfileService,
++    @IModelCatalog private readonly catalog: IModelCatalog,
++    @IConfigService private readonly configService: IConfigService,
++    @IEventDispatcher private readonly dispatcher: IEventDispatcher,
++  ) {
++    super();
++    this._register(
++      eventBus.subscribe(TurnStarted, () => {
++        this.attemptsInTurn = 0;
++        this.gaveUpInTurn = false;
++      }),
++    );
++    this._register(
++      this.loop.hooks.onDidFinishStep.register('gemini-filter-retry', async (step, next) => {
++        this.afterStep(step);
++        await next();
++      }),
++    );
++    this._register(
++      this.loop.registerLlmRecovery({
++        id: 'gemini-filter-retry',
++        propose: (failure) => this.proposeRetry(failure),
++      }),
++    );
++  }
++
++  private enabled(): boolean {
++    return geminiFilterRetryAppliesTo(
++      this.configService.get<GeminiFilterRetryConfig>(GEMINI_FILTER_RETRY_SECTION),
++      this.scopeContext.agentId === MAIN_AGENT_ID,
++    );
++  }
++
++  private usesGeminiModel(): boolean {
++    try {
++      if (!this.profile.hasModel()) return false;
++      const alias = this.profile.getModel();
++      const model = this.catalog.get(alias);
++      return isGeminiModelName(alias, model.providerName, model.name);
++    } catch {
++      return false;
++    }
++  }
++
++  private afterStep(step: AfterStepContext): void {
++    if (!this.enabled() || step.signal.aborted || step.stopTurn) return;
++    const blocked =
++      lastAssistantBlockReply(this.context.get()) ||
++      (step.finishReason === 'filtered' && this.usesGeminiModel());
++    if (!blocked) return;
++    const prompt = this.nextPrompt();
++    if (prompt === undefined) return;
++    this.loop.notify({ message: retryMessage(prompt), turnScoped: true });
++  }
++
++  private proposeRetry(failure: LoopLlmRecoveryContext): LoopLlmRecoveryProposal | undefined {
++    if (!this.enabled() || !isGeminiBlockError(failure.error, this.usesGeminiModel())) return undefined;
++    const prompt = this.nextPrompt();
++    if (prompt === undefined) return undefined;
++    return {
++      strategy: GEMINI_FILTER_RETRY_STRATEGY,
++      action: `continue ${String(this.attemptsInTurn)}/${String(GEMINI_FILTER_RETRY_MAX_ATTEMPTS)}`,
++      appendMessages: [retryMessage(prompt)],
++    };
++  }
++
++  private nextPrompt(): string | undefined {
++    if (this.attemptsInTurn >= GEMINI_FILTER_RETRY_MAX_ATTEMPTS) {
++      if (!this.gaveUpInTurn) {
++        this.gaveUpInTurn = true;
++        this.warn(
++          `Gemini's filter blocked the reply ${String(GEMINI_FILTER_RETRY_MAX_ATTEMPTS + 1)} times in a row; stopped retrying automatically. Rephrase the prompt or turn off "Gemini filter retry" in /settings.`,
++        );
++      }
++      return undefined;
++    }
++    this.attemptsInTurn += 1;
++    const prompt = geminiFilterRetryPrompt();
++    this.warn(
++      `Gemini's filter blocked the reply; retrying automatically (${String(this.attemptsInTurn)}/${String(GEMINI_FILTER_RETRY_MAX_ATTEMPTS)}) with "${prompt}"`,
++    );
++    return prompt;
++  }
++
++  private warn(message: string): void {
++    try {
++      void this.dispatcher.dispatch(
++        new WarningIssued({ agentId: this.scopeContext.agentId, code: GEMINI_FILTER_RETRY_STRATEGY, message }),
++      );
++    } catch {
++    }
++  }
++}
+diff --git a/packages/agent-core-v2/src/index.ts b/packages/agent-core-v2/src/index.ts
+index aeecfcd935b8a12572bc3ff606ce1aca13141aa9..5977dea496066d54462bc0fefd9134ba485d86dc 100644
+--- a/packages/agent-core-v2/src/index.ts
++++ b/packages/agent-core-v2/src/index.ts
+@@ -348,6 +348,9 @@ export * from '#/features/plan/plan';
+ export * from '#/features/plan/planOps';
+ export * from '#/features/plan/planService';
+ import '#/features/dateChange/dateChangeFeature';
++export * from '#/features/geminiFilterRetry/geminiFilterRetry';
++export * from '#/features/geminiFilterRetry/geminiFilterRetryService';
++import '#/features/geminiFilterRetry/geminiFilterRetryFeature';
+ import '#/features/plan/planFeature';
+ export * from '#/features/fileHistory/fileHistory';
+ export * from '#/features/fileHistory/fileHistoryOps';
+diff --git a/packages/agent-core-v2/test/agent/loop/stubs.ts b/packages/agent-core-v2/test/agent/loop/stubs.ts
+index 5b71d3d03a94da23193d1c46a955f5d7ff50f96c..b7493c40764293739b5cb9c259bbfddd17f490a1 100644
+--- a/packages/agent-core-v2/test/agent/loop/stubs.ts
++++ b/packages/agent-core-v2/test/agent/loop/stubs.ts
+@@ -202,6 +202,7 @@ export function stubLoopWithHooks(options: StubLoopOptions = {}): StubLoop {
+     attachEngine: () => stubAttachEngine(),
+     resetMachineEngine: () => Promise.resolve(),
+     registerLoopErrorHandler: errorHandlers.register,
++    registerLlmRecovery: () => toDisposable(() => {}),
+     settled: () => Promise.resolve(),
+     drainNextBatch(context) {
+       const batch = pending.splice(0);
+diff --git a/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts b/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
+index e6aca0757aa33245784499d729414ffb6967a378..a89494aecd11055b0d67e47fb010269a36c84fb0 100644
+--- a/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
++++ b/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
+@@ -269,6 +269,10 @@ class FakeLoopService implements IAgentLoopService {
+   registerLoopErrorHandler(): IDisposable {
+     throw new Error('unused in this suite');
+   }
++
++  registerLlmRecovery(): IDisposable {
++    throw new Error('unused in this suite');
++  }
+ }
+ 
+ class FakeContextMemory implements IAgentContextMemoryService {
+diff --git a/packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry.test.ts b/packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8b338c28b21e51afb69dc67ced05d8cf6533623
+--- /dev/null
++++ b/packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry.test.ts
+@@ -0,0 +1,300 @@
++import { afterEach, describe, expect, it } from 'vitest';
++
++import { TurnStarted } from '#/agent/loop/turnEvents';
++import { WarningIssued } from '#/agent/profile/profileOps';
++import { IEventBus } from '#/app/event/eventBus';
++import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
++import type { ContextMessage } from '#/agent/contextMemory/types';
++import { IAgentProfileService } from '#/agent/profile/profile';
++import { IAgentLifecycleService } from '#/session/agentLifecycle/agentLifecycle';
++import { runAgentTurn } from '#/session/subagent/runAgentTurn';
++import {
++  containsGeminiBlockNotice,
++  expandSpintax,
++  geminiFilterRetryAppliesTo,
++  geminiFilterRetryPrompt,
++  isGeminiBlockError,
++  isGeminiBlockReply,
++  isGeminiFilterRetryOrigin,
++} from '#/features/geminiFilterRetry/geminiFilterRetry';
++
++import { createTestAgent, type TestAgentContext } from '../../harness';
++
++const BLOCK_NOTICE =
++  "This request was blocked by Gemini's filters. They can occasionally trigger by mistake on safe coding, security, or biology-related queries. Please try rephrasing your prompt. You can send feedback or read more about our policies here.";
++
++const GEMINI_PROVIDER = { type: 'openai_responses', model: 'gemini-4-carbon-high', apiKey: 'k', baseUrl: 'https://forwarder.test/v1' } as const;
++
++function seeded(values: readonly number[]): () => number {
++  let index = 0;
++  return () => values[index++ % values.length] ?? 0;
++}
++
++describe('gemini filter retry detection', () => {
++  it('recognises the Gemini block notice', () => {
++    expect(containsGeminiBlockNotice(BLOCK_NOTICE)).toBe(true);
++    expect(containsGeminiBlockNotice(BLOCK_NOTICE.replace("'", '’'))).toBe(true);
++    expect(containsGeminiBlockNotice('Error: blocked by GEMINI’S FILTERS')).toBe(true);
++    expect(containsGeminiBlockNotice('Please try rephrasing your prompt.')).toBe(false);
++    expect(containsGeminiBlockNotice('The build is blocked by a failing filter test.')).toBe(false);
++  });
++
++  it('treats only a short reply carrying the notice as a blocked reply', () => {
++    expect(isGeminiBlockReply(`  ${BLOCK_NOTICE}\n`)).toBe(true);
++    expect(isGeminiBlockReply('')).toBe(false);
++    expect(isGeminiBlockReply(`Here is the fix.\n${'x'.repeat(1_000)}\nIt quotes "${BLOCK_NOTICE}"`)).toBe(false);
++  });
++
++  it('matches failed requests by notice text, and filtered empty replies only on Gemini models', () => {
++    expect(isGeminiBlockError({ kind: 'status', message: `Error code: 400 - ${BLOCK_NOTICE}` }, false)).toBe(true);
++    expect(isGeminiBlockError({ kind: 'unknown', message: BLOCK_NOTICE }, false)).toBe(true);
++    const filtered = {
++      kind: 'empty_response',
++      message: 'The API returned an empty response (no content, no tool calls).',
++      finishReason: 'filtered',
++    };
++    expect(isGeminiBlockError(filtered, true)).toBe(true);
++    expect(isGeminiBlockError(filtered, false)).toBe(false);
++    expect(
++      isGeminiBlockError(
++        { kind: 'empty_response', message: 'Provider stop details: finishReason=filtered, rawFinishReason=SAFETY.' },
++        true,
++      ),
++    ).toBe(true);
++    expect(isGeminiBlockError({ kind: 'connection', message: 'Connection reset' }, true)).toBe(false);
++    expect(isGeminiBlockError(undefined, true)).toBe(false);
++  });
++
++  it('applies to all agents, subagents only, or none', () => {
++    expect(geminiFilterRetryAppliesTo(undefined, true)).toBe(true);
++    expect(geminiFilterRetryAppliesTo(true, true)).toBe(true);
++    expect(geminiFilterRetryAppliesTo(true, false)).toBe(true);
++    expect(geminiFilterRetryAppliesTo('subagents', true)).toBe(false);
++    expect(geminiFilterRetryAppliesTo('subagents', false)).toBe(true);
++    expect(geminiFilterRetryAppliesTo(false, true)).toBe(false);
++    expect(geminiFilterRetryAppliesTo(false, false)).toBe(false);
++  });
++
++  it('only recognises its own system trigger origin', () => {
++    expect(isGeminiFilterRetryOrigin({ kind: 'system_trigger', name: 'gemini_filter_retry' })).toBe(true);
++    expect(isGeminiFilterRetryOrigin({ kind: 'system_trigger', name: 'goal_continuation' })).toBe(false);
++    expect(isGeminiFilterRetryOrigin({ kind: 'user' })).toBe(false);
++    expect(isGeminiFilterRetryOrigin(undefined)).toBe(false);
++  });
++});
++
++describe('gemini filter retry spintax', () => {
++  it('expands nested groups and tidies spacing and capitalisation', () => {
++    expect(expandSpintax('{Please|Kindly} {continue|resume}{ now|}{.|!}', seeded([0]))).toBe('Please continue now.');
++    expect(expandSpintax('{Please|} {continue|resume}{ now|}{.|!}', seeded([0.99]))).toBe('Resume!');
++    expect(expandSpintax('{What happened|Hm}? {|ok} {go {on|ahead}|carry on}.', seeded([0, 0, 0.99, 0]))).toBe(
++      'What happened? Go ahead.',
++    );
++  });
++
++  it('always produces a clean, non-empty continue prompt', () => {
++    const seen = new Set<string>();
++    for (let seed = 0; seed < 400; seed += 1) {
++      let state = seed * 7919 + 17;
++      const random = () => {
++        state = (state * 1103515245 + 12345) % 2147483648;
++        return state / 2147483648;
++      };
++      const prompt = geminiFilterRetryPrompt(random);
++      expect(prompt).not.toMatch(/[{}|]/);
++      expect(prompt).not.toMatch(/\s{2,}|\s[.!?,]|^\s|\s$/);
++      expect(prompt).toMatch(/^[A-Z]/);
++      expect(prompt.length).toBeGreaterThan(3);
++      seen.add(prompt);
++    }
++    expect(seen.size).toBeGreaterThan(40);
++  });
++});
++
++describe('AgentGeminiFilterRetryService', () => {
++  let ctx: TestAgentContext | undefined;
++
++  afterEach(async () => {
++    await ctx?.dispose();
++    ctx = undefined;
++  });
++
++  function watch(agent: TestAgentContext): { readonly started: TurnStarted[]; readonly warnings: WarningIssued[] } {
++    const bus = agent.get(IEventBus);
++    const started: TurnStarted[] = [];
++    const warnings: WarningIssued[] = [];
++    bus.subscribe(TurnStarted, (event) => started.push(event));
++    bus.subscribe(WarningIssued, (event) => warnings.push(event));
++    return { started, warnings };
++  }
++
++  function textOf(message: ContextMessage | undefined): string {
++    return message?.content.map((part) => (part.type === 'text' ? part.text : '')).join('') ?? '';
++  }
++
++  function retryMessages(history: readonly ContextMessage[]): ContextMessage[] {
++    return history.filter((message) => isGeminiFilterRetryOrigin(message.origin as { kind: string; name?: string } | undefined));
++  }
++
++  it('continues the same turn with a spintax prompt when the reply is the block notice', async () => {
++    ctx = createTestAgent();
++    ctx.configure();
++    const events = watch(ctx);
++    ctx.mockNextResponse({ type: 'text', text: BLOCK_NOTICE });
++    ctx.mockNextResponse({ type: 'text', text: 'Resumed the work.' });
++
++    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Refactor the parser' }] });
++    await ctx.untilTurnEnd();
++
++    expect(events.started).toHaveLength(1);
++    const history = ctx.contextData().history;
++    const retries = retryMessages(history);
++    expect(retries).toHaveLength(1);
++    expect(retries[0]?.role).toBe('user');
++    const retryText = textOf(retries[0]);
++    expect(retryText).toMatch(/^[A-Z]/);
++    expect(history.at(-2)).toBe(retries[0]);
++    expect(textOf(history.at(-1))).toBe('Resumed the work.');
++    expect(events.warnings.map((warning) => warning.code)).toEqual(['gemini_filter_retry']);
++    expect(events.warnings[0]?.message).toContain('(1/5)');
++    expect(events.warnings[0]?.message).toContain(`"${retryText}"`);
++  });
++
++  it('re-asks with a spintax prompt when a Gemini request fails with the notice', async () => {
++    ctx = createTestAgent();
++    ctx.configure({ provider: GEMINI_PROVIDER });
++    const events = watch(ctx);
++    ctx.mockNextProviderResponse({ error: new Error(BLOCK_NOTICE) });
++    ctx.mockNextResponse({ type: 'text', text: 'Back on track.' });
++
++    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Audit the auth code' }] });
++    await ctx.untilTurnEnd();
++
++    expect(events.started).toHaveLength(1);
++    expect(events.warnings.map((warning) => warning.code)).toEqual(['gemini_filter_retry']);
++    const retryText = /with "(.*)"$/.exec(events.warnings[0]?.message ?? '')?.[1] ?? '';
++    expect(retryText).toMatch(/^[A-Z]/);
++    expect(ctx.llmCalls).toHaveLength(2);
++    const lastSent = ctx.llmCalls[1]?.history.at(-1);
++    expect(lastSent?.role).toBe('user');
++    expect(JSON.stringify(lastSent?.content)).toContain(retryText);
++    const history = ctx.contextData().history;
++    expect(retryMessages(history).map(textOf)).toEqual([retryText]);
++    expect(textOf(history.at(-1))).toBe('Back on track.');
++  });
++
++  it('stops after five retries of a failing Gemini request and fails the turn', async () => {
++    ctx = createTestAgent();
++    ctx.configure({ provider: GEMINI_PROVIDER });
++    const events = watch(ctx);
++    for (let index = 0; index < 6; index += 1) ctx.mockNextProviderResponse({ error: new Error(BLOCK_NOTICE) });
++
++    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Audit the auth code' }] });
++    await ctx.untilTurnEnd();
++
++    expect(ctx.llmCalls).toHaveLength(6);
++    expect(retryMessages(ctx.contextData().history)).toHaveLength(5);
++    expect(events.warnings.at(-1)?.message).toContain('stopped retrying');
++  });
++
++  it('gives up after five retries in one turn and counts again from the next prompt', async () => {
++    ctx = createTestAgent();
++    ctx.configure();
++    const events = watch(ctx);
++    for (let index = 0; index < 6; index += 1) ctx.mockNextResponse({ type: 'text', text: BLOCK_NOTICE });
++
++    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Write the mitigation' }] });
++    await ctx.untilTurnEnd();
++
++    expect(events.started).toHaveLength(1);
++    expect(retryMessages(ctx.contextData().history)).toHaveLength(5);
++    expect(events.warnings.map((warning) => /\((\d)\/5\)/.exec(warning.message)?.[1] ?? 'stop')).toEqual([
++      '1', '2', '3', '4', '5', 'stop',
++    ]);
++
++    ctx.mockNextResponse({ type: 'text', text: BLOCK_NOTICE });
++    ctx.mockNextResponse({ type: 'text', text: 'Done.' });
++    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Try again' }] });
++    await ctx.untilTurnEnd();
++    expect(events.warnings.at(-1)?.message).toContain('(1/5)');
++    expect(textOf(ctx.contextData().history.at(-1))).toBe('Done.');
++  });
++
++  async function runSubagent(agent: TestAgentContext, prompt: string) {
++    const lifecycle = agent.get(IAgentLifecycleService);
++    const sub = await lifecycle.create({ agentId: 'agent-1' });
++    const handle = lifecycle.handleOf(sub.agentId);
++    if (handle === undefined) throw new Error('subagent handle missing');
++    handle.accessor.get(IAgentProfileService).update({
++      modelAlias: 'mock-model',
++      systemPrompt: 'You are a subagent.',
++      thinkingLevel: 'off',
++    });
++    const run = await runAgentTurn(handle, { kind: 'prompt', prompt }, { signal: new AbortController().signal });
++    const completion = await run.completion;
++    const history = handle.accessor.get(IAgentContextMemoryService).get();
++    await lifecycle.remove(sub);
++    return { completion, history };
++  }
++
++  it('retries inside a subagent run so the parent receives the real answer', async () => {
++    ctx = createTestAgent();
++    ctx.configure();
++    ctx.mockNextResponse({ type: 'text', text: BLOCK_NOTICE });
++    ctx.mockNextResponse({ type: 'text', text: 'Subagent summary.' });
++
++    const { completion, history } = await runSubagent(ctx, 'Investigate the crash');
++
++    expect(completion.summary).toBe('Subagent summary.');
++    expect(retryMessages(history)).toHaveLength(1);
++    expect(retryMessages(ctx.contextData().history)).toHaveLength(0);
++  });
++
++  it('in subagents-only mode retries subagents but leaves the main conversation stopped', async () => {
++    ctx = createTestAgent({ initialConfig: { geminiFilterRetry: 'subagents' } });
++    ctx.configure();
++    const events = watch(ctx);
++    ctx.mockNextResponse({ type: 'text', text: BLOCK_NOTICE });
++
++    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Hello' }] });
++    await ctx.untilTurnEnd();
++
++    expect(retryMessages(ctx.contextData().history)).toEqual([]);
++    expect(events.warnings).toEqual([]);
++    expect(textOf(ctx.contextData().history.at(-1))).toBe(BLOCK_NOTICE);
++
++    ctx.mockNextResponse({ type: 'text', text: BLOCK_NOTICE });
++    ctx.mockNextResponse({ type: 'text', text: 'Subagent summary.' });
++    const { completion, history } = await runSubagent(ctx, 'Investigate the crash');
++
++    expect(completion.summary).toBe('Subagent summary.');
++    expect(retryMessages(history)).toHaveLength(1);
++  });
++
++  it('does nothing when the setting is off', async () => {
++    ctx = createTestAgent({ initialConfig: { geminiFilterRetry: false } });
++    ctx.configure();
++    const events = watch(ctx);
++    ctx.mockNextResponse({ type: 'text', text: BLOCK_NOTICE });
++
++    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Hello' }] });
++    await ctx.untilTurnEnd();
++
++    expect(retryMessages(ctx.contextData().history)).toEqual([]);
++    expect(events.warnings).toEqual([]);
++    expect(textOf(ctx.contextData().history.at(-1))).toBe(BLOCK_NOTICE);
++  });
++
++  it('leaves ordinary replies alone', async () => {
++    ctx = createTestAgent();
++    ctx.configure({ provider: GEMINI_PROVIDER });
++    const events = watch(ctx);
++    ctx.mockNextResponse({ type: 'text', text: `The tool printed: "${BLOCK_NOTICE}" ${'and more context. '.repeat(60)}` });
++
++    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'What does this error mean?' }] });
++    await ctx.untilTurnEnd();
++
++    expect(retryMessages(ctx.contextData().history)).toEqual([]);
++    expect(events.warnings).toEqual([]);
++  });
++});
+diff --git a/packages/agent-core-v2/test/session/subagent/subagentScopeCache.test.ts b/packages/agent-core-v2/test/session/subagent/subagentScopeCache.test.ts
+index 55d3fd38946b77670c7f08bc8396cca3dcf0d1f7..4187741908899297ff8913911e0cb85561327518 100644
+--- a/packages/agent-core-v2/test/session/subagent/subagentScopeCache.test.ts
++++ b/packages/agent-core-v2/test/session/subagent/subagentScopeCache.test.ts
+@@ -461,6 +461,7 @@ describe('SessionSubagentScopeCacheService', () => {
+         onDidFinishStep: { register: () => ({ dispose: () => {} }) },
+       },
+       registerLoopErrorHandler: () => ({ dispose: () => {} }),
++      registerLlmRecovery: () => ({ dispose: () => {} }),
+       snapshot: () => ({
+         state: 'idle',
+         queue: [],
+diff --git a/packages/kap-server/src/protocol/rest-config.ts b/packages/kap-server/src/protocol/rest-config.ts
+index 4394705ed8107d457a0f42df703b937a5746f92e..b25611d3d91ef8833e6d85d5a08c7f0cb84129d2 100644
+--- a/packages/kap-server/src/protocol/rest-config.ts
++++ b/packages/kap-server/src/protocol/rest-config.ts
+@@ -33,6 +33,7 @@ export const configResponseSchema = z
+     experimental: z.record(z.string(), z.boolean()).optional(),
+     telemetry: z.boolean().optional(),
+     disable_feedback_survey: z.boolean().optional(),
++    gemini_filter_retry: z.union([z.boolean(), z.literal('subagents')]).optional(),
+     raw: z.record(z.string(), z.unknown()).optional(),
+   })
+   .passthrough();
+@@ -61,5 +62,6 @@ export const patchConfigRequestSchema = z.object({
+   experimental: z.record(z.string(), z.boolean()).optional(),
+   telemetry: z.boolean().optional(),
+   disable_feedback_survey: z.boolean().optional(),
++  gemini_filter_retry: z.union([z.boolean(), z.literal('subagents')]).optional(),
+ });
+ export type PatchConfigRequest = z.infer<typeof patchConfigRequestSchema>;
+diff --git a/packages/node-sdk/src/config/schema.ts b/packages/node-sdk/src/config/schema.ts
+index b149791434980b6d98d6e98ffd0e86f107985538..07f65758c092cf591c02ed9ef76ddd264accd622 100644
+--- a/packages/node-sdk/src/config/schema.ts
++++ b/packages/node-sdk/src/config/schema.ts
+@@ -314,6 +314,7 @@ export const KimiConfigSchema = z.object({
+   experimental: ExperimentalConfigSchema.optional(),
+   telemetry: z.boolean().optional(),
+   disableFeedbackSurvey: z.boolean().optional(),
++  geminiFilterRetry: z.union([z.boolean(), z.literal('subagents')]).optional(),
+   raw: z.record(z.string(), z.unknown()).optional(),
+ });
+ 
+@@ -365,6 +366,7 @@ export const KimiConfigPatchSchema = z
+     experimental: ExperimentalConfigPatchSchema.optional(),
+     telemetry: z.boolean().optional(),
+     disableFeedbackSurvey: z.boolean().optional(),
++    geminiFilterRetry: z.union([z.boolean(), z.literal('subagents')]).optional(),
+   })
+   .strict();
+ 
+diff --git a/packages/node-sdk/src/config/toml.ts b/packages/node-sdk/src/config/toml.ts
+index 71c8eaca85f25052b37386c16f3b6c3bb636ccb3..a9196d7abc84f3e27c53f054045c86030acced47 100644
+--- a/packages/node-sdk/src/config/toml.ts
++++ b/packages/node-sdk/src/config/toml.ts
+@@ -446,6 +446,7 @@ export function configToTomlData(config: KimiConfig): Record<string, unknown> {
+     'extraAgentDirs',
+     'telemetry',
+     'disableFeedbackSurvey',
++    'geminiFilterRetry',
+   ];
+   for (const key of scalarFields) {
+     setDefined(out, camelToSnake(key), config[key]);
+diff --git a/packages/node-sdk/src/v2/config-mapper.ts b/packages/node-sdk/src/v2/config-mapper.ts
+index 89b23bad3a6ded5e2a3a56fdf982e6af1bb5dd8f..ffb5d84ad603e88cdfd1d8ade1155ba6eb3e40c1 100644
+--- a/packages/node-sdk/src/v2/config-mapper.ts
++++ b/packages/node-sdk/src/v2/config-mapper.ts
+@@ -46,6 +46,7 @@ const KIMI_CONFIG_DOMAINS = [
+   'experimental',
+   'telemetry',
+   'disableFeedbackSurvey',
++  'geminiFilterRetry',
+ ] as const;
+ 
+ /**
+-- 
+2.50.1 (Apple Git-155)
+
