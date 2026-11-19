@@ -645,6 +645,16 @@ capabilities = [ "tool_use", "image_in", "always_thinking" ]
 support_efforts = [ "low", "medium", "high" ]
 default_effort = "high"
 
+[models."gemini/neon"]
+provider = "gemini"
+model = "gemini-4-neon-high"
+display_name = "Gemini 4 Neon (agy)"
+max_context_size = 1048576
+max_output_size = 262144
+capabilities = [ "tool_use", "image_in", "always_thinking" ]
+support_efforts = [ "low", "medium", "high", "xhigh" ]
+default_effort = "high"
+
 [models."gemini/flash"]
 provider = "gemini"
 model = "gemini-3.8-flash-high"
