@@ -1,23 +1,33 @@
-From 1572caa20942a111fc050792a0ceca7dc822bc58 Mon Sep 17 00:00:00 2001
+From f41c66329435514416b023defb1a7e0efd41e12d Mon Sep 17 00:00:00 2001
 From: Administrator <administrator@Mac.lan>
 Date: Thu, 22 Oct 2026 16:04:19 +0200
-Subject: [PATCH 08/13] customkimi: show OpenRouter's balance and session cost
+Subject: [PATCH 07/15] customkimi: show OpenRouter's balance and session cost
  in the footer
 
 OpenRouter is the third billing provider. The balance comes from /credits with the management key (environment, else the macOS Keychain, never exported into Kimi's environment), else from the API key's limit_remaining; prices from the public model list cover replies without usage.cost. Tests blank the provider key variables so the footer never polls real balances.
 ---
- .../src/utils/billing/billing-provider.ts     |   8 +-
+ .../src/utils/billing/billing-provider.ts     |  10 +-
  .../kimi-code/src/utils/billing/openrouter.ts | 137 +++++++++
  apps/kimi-code/src/utils/billing/providers.ts |   7 +-
+ .../test/tui/components/chrome/footer.test.ts |   2 +-
  .../utils/billing/billing-providers.test.ts   | 273 +++++++++++++++++-
  apps/kimi-code/vitest.config.ts               |   6 +
- 5 files changed, 422 insertions(+), 9 deletions(-)
+ 6 files changed, 424 insertions(+), 11 deletions(-)
  create mode 100644 apps/kimi-code/src/utils/billing/openrouter.ts
 
 diff --git a/apps/kimi-code/src/utils/billing/billing-provider.ts b/apps/kimi-code/src/utils/billing/billing-provider.ts
-index 1b3f7eca5577b98f1a4f3fbd3a6e39bc4fa7f73b..c1a0174bfc8cc04744047e2a7f8242b5e568d236 100644
+index 1b3f7eca5577b98f1a4f3fbd3a6e39bc4fa7f73b..577c6da9363b777b4336a467d6b2feeb2e7287fe 100644
 --- a/apps/kimi-code/src/utils/billing/billing-provider.ts
 +++ b/apps/kimi-code/src/utils/billing/billing-provider.ts
+@@ -20,7 +20,7 @@ export function costOfUsage(usage: BillableTokens, prices: TokenPrices): number
+   return (
+     (usage.inputOther * prices.input +
+       usage.output * prices.output +
+-      usage.inputCacheRead * prices.cacheRead +
++      (usage.inputCacheRead ?? 0) * prices.cacheRead +
+       usage.inputCacheCreation * prices.cacheWrite) /
+     1_000_000
+   );
 @@ -93,9 +93,11 @@ export abstract class BillingProvider {
      return value === undefined || value === '' ? undefined : value;
    }
@@ -195,6 +205,19 @@ index 91c1d1c8d68de5342b8020f7132442aaf06a7c41..3423c122ba0f7c7627d23cb20b98917d
 +    new OpenRouterBilling(env, fetcher),
 +  ];
  }
+diff --git a/apps/kimi-code/test/tui/components/chrome/footer.test.ts b/apps/kimi-code/test/tui/components/chrome/footer.test.ts
+index 50a749f9ef78566bfd84f7351f64b6128082aec3..7f9eb8e27da0ad3a3ab3ac5d21a1c9b825e18169 100644
+--- a/apps/kimi-code/test/tui/components/chrome/footer.test.ts
++++ b/apps/kimi-code/test/tui/components/chrome/footer.test.ts
+@@ -355,7 +355,7 @@ describe('FooterComponent', () => {
+         },
+       };
+       const render = (patch: Partial<AppState>) => {
+-        const footer = new FooterComponent({ ...state, ...patch }, () => {}, new BillingMonitor([]));
++        const footer = new FooterComponent({ ...state, ...patch }, () => {}, false, new BillingMonitor([]));
+         const rendered = plain(footer);
+         footer.dispose();
+         return rendered;
 diff --git a/apps/kimi-code/test/utils/billing/billing-providers.test.ts b/apps/kimi-code/test/utils/billing/billing-providers.test.ts
 index ae32d190517f2cdff9ecc6df34f883c3a818f309..896035c3091ceb5930721d3d6d82bd5495a8917a 100644
 --- a/apps/kimi-code/test/utils/billing/billing-providers.test.ts

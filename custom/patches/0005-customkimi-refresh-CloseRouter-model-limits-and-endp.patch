@@ -1,7 +1,7 @@
-From 170f3bdbda097f5182d994828540c6dd5f21a470 Mon Sep 17 00:00:00 2001
+From 9a3e14c6dd82a4557b19095cffc874504ec9d360 Mon Sep 17 00:00:00 2001
 From: CustomKIMI <customkimi@localhost>
 Date: Fri, 16 Oct 2026 13:20:02 +0200
-Subject: [PATCH 06/13] customkimi: refresh CloseRouter model limits and
+Subject: [PATCH 05/15] customkimi: refresh CloseRouter model limits and
  endpoint efforts
 
 At startup (and on the server's scheduled refresh), configured aliases whose endpoint is CloseRouter take context_length and max_output_tokens from GET /v1/models and the supported_reasoning_efforts of the endpoint they are actually called through (Chat Completions, Responses or Messages, following per-model base_url and protocol overrides) from GET /v1/models/{author}/{model}/endpoints. The catalog is never imported. Chat and Responses endpoints without a none effort become always_thinking so "off" is never offered or sent; Messages keeps native Anthropic thinking. Requests go only to api.closerouter.dev with redirects refused, are bounded (4 at once, 10 s each, 30 s total) and never put the key in a message. A provider's key is sent only when that provider itself points at CloseRouter; an alias that merely re-routes another provider there is skipped and reported. Failures keep the last-good values and are reported; metadata that would invalidate [secondary_model].default_effort is kept back and reported. The patch is merged into a freshly read config, only the models section is written, and [models."<alias>".overrides] are never touched. The TUI shows what changed and re-reads the active model's context limit and effort after a refresh, and its pre-session footer uses the effective limits.
@@ -9,20 +9,20 @@ At startup (and on the server's scheduled refresh), configured aliases whose end
  .changeset/closerouter-model-metadata.md      |   5 +
  .../src/tui/controllers/auth-flow.ts          |   5 +-
  apps/kimi-code/src/tui/kimi-tui.ts            |  34 +
- apps/kimi-code/src/tui/utils/model-switch.ts  |  25 +-
+ apps/kimi-code/src/tui/utils/model-switch.ts  |  23 +-
  .../src/tui/utils/thinking-config.ts          |  37 +-
  .../test/tui/kimi-tui-startup.test.ts         | 130 +++
  .../test/tui/utils/thinking-config.test.ts    |  50 +
  .../src/app/kosongConfig/discovery.ts         |   1 +
  .../src/app/kosongConfig/discoveryService.ts  |   6 +
- .../model/closerouterRequests.test.ts         | 320 +++++++
+ .../model/closerouterRequests.test.ts         | 322 +++++++
  packages/klient/src/contract/global/events.ts |   1 +
  .../src/contract/global/providerDiscovery.ts  |   1 +
  .../node-sdk/test/sdk-rpc-client-v2.test.ts   |  48 +
  packages/oauth/src/closerouter.ts             | 761 +++++++++++++++
- packages/oauth/src/refreshProviderModels.ts   |  31 +
+ packages/oauth/src/refreshProviderModels.ts   |  25 +
  packages/oauth/test/closerouter.test.ts       | 902 ++++++++++++++++++
- 16 files changed, 2339 insertions(+), 18 deletions(-)
+ 16 files changed, 2335 insertions(+), 16 deletions(-)
  create mode 100644 .changeset/closerouter-model-metadata.md
  create mode 100644 packages/agent-core-v2/test/llm-adapter/model/closerouterRequests.test.ts
  create mode 100644 packages/oauth/src/closerouter.ts
@@ -40,19 +40,19 @@ index 0000000000000000000000000000000000000000..3701e1620f6b2fb17810e23fcffdbc60
 +
 +Refresh CloseRouter models' context limits, output limits, and reasoning efforts from CloseRouter at startup, replacing those values in config.toml; keep your own under `[models."<alias>".overrides]`.
 diff --git a/apps/kimi-code/src/tui/controllers/auth-flow.ts b/apps/kimi-code/src/tui/controllers/auth-flow.ts
-index 191e1aa3e770126146bfae31545fc6a8ff448fa6..9e1e84903e1bf3f0e40bc914382be25d269fdb15 100644
+index e9d04498affa22ddbe9d6ff058799891ed33af51..14309f331bf2f5e490a2b5fc026a8d99a6be75df 100644
 --- a/apps/kimi-code/src/tui/controllers/auth-flow.ts
 +++ b/apps/kimi-code/src/tui/controllers/auth-flow.ts
-@@ -11,7 +11,7 @@ import {
- } from '../commands/config';
- import type { SlashCommandHost } from '../commands/dispatch';
- import { OAUTH_LOGIN_REQUIRED_STARTUP_NOTICE } from '../constant/kimi-tui';
+@@ -15,7 +15,7 @@ import { OAUTH_LOGIN_REQUIRED_STARTUP_NOTICE } from '../constant/kimi-tui';
+ import { refreshEffortSwitchConfig } from '#/utils/effort-switch-config';
+ import { refreshModelSwitchConfirmConfig } from '#/utils/model-switch-confirm-config';
+ import { lazyModelSelection } from '../utils/model-switch';
 -import { thinkingEffortFromConfig } from '../utils/thinking-config';
 +import { configuredModelDefaults, thinkingEffortFromConfig } from '../utils/thinking-config';
  import type { AppState, KimiTUIOptions } from '../types';
  
  export interface AuthFlowHost {
-@@ -144,7 +144,8 @@ export class AuthFlowController {
+@@ -130,7 +130,8 @@ export class AuthFlowController {
        availableModels,
        availableProviders,
        model: defaultModel,
@@ -63,10 +63,10 @@ index 191e1aa3e770126146bfae31545fc6a8ff448fa6..9e1e84903e1bf3f0e40bc914382be25d
      host.setAppState(appStatePatch);
      return activated;
 diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
-index 8c270056fe14c69f50bdf82f18c069f000721c5c..62a3fee61cdb09eaf4e887feb11039d578005f84 100644
+index 8311dd7bc355fce25e5a4effee19d9c19e95b811..c7f7ce2428ec1aa3701192004641b63a370797b9 100644
 --- a/apps/kimi-code/src/tui/kimi-tui.ts
 +++ b/apps/kimi-code/src/tui/kimi-tui.ts
-@@ -201,6 +201,7 @@ import { isSessionOccupiedError } from './utils/session-lock-errors';
+@@ -224,6 +224,7 @@ import { isSessionOccupiedError } from './utils/session-lock-errors';
  import { formatStepRetryDetail, formatStepRetryLabel } from './utils/step-retry';
  import { formatBashOutputForDisplay } from './utils/shell-output';
  import { lazyModelSelection } from './utils/model-switch';
@@ -74,7 +74,7 @@ index 8c270056fe14c69f50bdf82f18c069f000721c5c..62a3fee61cdb09eaf4e887feb11039d5
  import { combineStartupNotice, isOAuthLoginRequiredError } from './utils/startup';
  import { installTerminalFocusTracking } from './utils/terminal-focus';
  import { notifyTerminalOnce } from './utils/terminal-notification';
-@@ -858,6 +859,8 @@ export class KimiTUI {
+@@ -1038,6 +1039,8 @@ export class KimiTUI {
      try {
        const result = await this.authFlow.refreshProviderModels();
        for (const c of result.changed) {
@@ -83,15 +83,15 @@ index 8c270056fe14c69f50bdf82f18c069f000721c5c..62a3fee61cdb09eaf4e887feb11039d5
          if (c.added <= 0) continue;
          this.showStatus(`${c.provider_name} · +${String(c.added)} model${c.added > 1 ? 's' : ''}.`);
        }
-@@ -867,6 +870,7 @@ export class KimiTUI {
+@@ -1047,6 +1050,7 @@ export class KimiTUI {
        if (result.retired_default !== undefined) {
          await this.modelMigration.retire(result.retired_default);
        }
 +      if (result.changed.length > 0) await this.applyRefreshedModelLimits();
-     } catch {
-       // Best-effort: startup must not crash on background refresh failures.
-     }
-@@ -894,6 +898,36 @@ export class KimiTUI {
+     } catch {}
+   }
+ 
+@@ -1072,6 +1076,36 @@ export class KimiTUI {
      } catch {}
    }
  
@@ -129,7 +129,7 @@ index 8c270056fe14c69f50bdf82f18c069f000721c5c..62a3fee61cdb09eaf4e887feb11039d5
      if (this.startupNotice !== undefined) {
        this.showStatus(this.startupNotice);
 diff --git a/apps/kimi-code/src/tui/utils/model-switch.ts b/apps/kimi-code/src/tui/utils/model-switch.ts
-index 2c7c182b96d7fe9d2c02330f77ac3e4dba1d26e5..8f60249ff8b0ec7f7c85e3acf21acf5e61d4c3da 100644
+index f4047713efb3d89faedb609ac70c985e90a2b355..17eaa550324abb36ad44a47b4371fb10c96d0c7c 100644
 --- a/apps/kimi-code/src/tui/utils/model-switch.ts
 +++ b/apps/kimi-code/src/tui/utils/model-switch.ts
 @@ -6,10 +6,10 @@ import {
@@ -138,15 +138,15 @@ index 2c7c182b96d7fe9d2c02330f77ac3e4dba1d26e5..8f60249ff8b0ec7f7c85e3acf21acf5e
  import type { SlashCommandHost } from '../commands/dispatch';
 -import { defaultThinkingEffortFor, modelDisplayName } from '../components/dialogs/model-selector';
 +import { modelDisplayName } from '../components/dialogs/model-selector';
- import type { AppState } from '../types';
+ import type { AppState, ModelSwitchPersistence } from '../types';
  import { formatErrorMessage } from './event-payload';
 -import { thinkingEffortFromConfig, thinkingEffortToConfig } from './thinking-config';
 +import { configuredModelDefaults, thinkingEffortToConfig } from './thinking-config';
  
  export const MODEL_SWITCH_CACHE_WARNING =
    'Note: Switching models invalidates the existing prompt cache. Use /new to avoid extra token costs.';
-@@ -46,20 +46,15 @@ export function lazyModelSelection(
-   // first lazy-created session.
+@@ -32,18 +32,15 @@ export function lazyModelSelection(
+ ): Partial<AppState> {
    const patch: Partial<AppState> =
      alias === undefined ? { model: '', maxContextTokens: 0 } : { model: alias };
 -  const raw = alias === undefined ? undefined : config.models?.[alias];
@@ -163,8 +163,6 @@ index 2c7c182b96d7fe9d2c02330f77ac3e4dba1d26e5..8f60249ff8b0ec7f7c85e3acf21acf5e
 -  if (effort !== undefined) {
 -    patch.thinkingEffort = effort;
 -  } else if (raw !== undefined) {
--    // No concrete effort configured: mirror the engine, which resolves the
--    // model's default effort at createSession time.
 -    const providerType = config.providers?.[raw.provider]?.type;
 -    patch.thinkingEffort = defaultThinkingEffortFor(
 -      effectiveModelAlias(raw, providerType ?? raw.protocol),
@@ -175,7 +173,7 @@ index 2c7c182b96d7fe9d2c02330f77ac3e4dba1d26e5..8f60249ff8b0ec7f7c85e3acf21acf5e
    return patch;
  }
 diff --git a/apps/kimi-code/src/tui/utils/thinking-config.ts b/apps/kimi-code/src/tui/utils/thinking-config.ts
-index 79dff432398d8822c14a1dfcaf24eadc302260ed..b5d3eca30639b5fa339cb8bdd425143182214aa1 100644
+index 4711121a0b4ed4e3123a79e9f286712785c3ce94..dbf262f7736c8b1f19e9bf354ceed21da0564aaf 100644
 --- a/apps/kimi-code/src/tui/utils/thinking-config.ts
 +++ b/apps/kimi-code/src/tui/utils/thinking-config.ts
 @@ -1,4 +1,11 @@
@@ -189,9 +187,9 @@ index 79dff432398d8822c14a1dfcaf24eadc302260ed..b5d3eca30639b5fa339cb8bdd4251431
 +
 +import { defaultThinkingEffortFor } from '../components/dialogs/model-selector';
  
- /** Whether a thinking effort represents "thinking enabled" (anything but 'off'). */
  export function isThinkingOn(effort: ThinkingEffort): boolean {
-@@ -58,3 +65,31 @@ export function thinkingEffortFromConfig(
+   return effort !== 'off';
+@@ -31,3 +38,31 @@ export function thinkingEffortFromConfig(
    if (config?.enabled === false) return 'off';
    return config?.effort;
  }
@@ -224,10 +222,10 @@ index 79dff432398d8822c14a1dfcaf24eadc302260ed..b5d3eca30639b5fa339cb8bdd4251431
 +  };
 +}
 diff --git a/apps/kimi-code/test/tui/kimi-tui-startup.test.ts b/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
-index 8141ba4bbc900f9aef8fdefe57b772c3c9b22028..6985fb0b96ca05c11e048528d107859a47fe3532 100644
+index 0744f9753adef452eb92d14cd674b6b5919a6ec5..cee225ae634472a5bedb6aa915657bb7b1f09731 100644
 --- a/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
 +++ b/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
-@@ -859,6 +859,136 @@ describe('KimiTUI startup', () => {
+@@ -1301,6 +1301,136 @@ describe('KimiTUI startup', () => {
      expect(driver.state.appState.permissionMode).toBe('auto');
    });
  
@@ -365,7 +363,7 @@ index 8141ba4bbc900f9aef8fdefe57b772c3c9b22028..6985fb0b96ca05c11e048528d107859a
      const goal = goalSnapshot({ status: 'blocked', terminalReason: 'needs input' });
      const session = makeSession({
 diff --git a/apps/kimi-code/test/tui/utils/thinking-config.test.ts b/apps/kimi-code/test/tui/utils/thinking-config.test.ts
-index fd41b76681e3dcbedc69accd5eb3e385051817c2..c88441fa172c803e19cab3641e480b6772a6d005 100644
+index 1da672a120fbaa6a8c73764b205701c385a7e7d6..4b6b408ea0e3238ce3fdd10d46e00990667b37a8 100644
 --- a/apps/kimi-code/test/tui/utils/thinking-config.test.ts
 +++ b/apps/kimi-code/test/tui/utils/thinking-config.test.ts
 @@ -1,6 +1,7 @@
@@ -376,7 +374,7 @@ index fd41b76681e3dcbedc69accd5eb3e385051817c2..c88441fa172c803e19cab3641e480b67
    isThinkingOn,
    thinkingEffortFromConfig,
    thinkingEffortToConfig,
-@@ -128,3 +129,52 @@ describe('thinkingEffortFromConfig', () => {
+@@ -115,3 +116,52 @@ describe('thinkingEffortFromConfig', () => {
      expect(thinkingEffortFromConfig(config)).toBe(expected);
    });
  });
@@ -430,7 +428,7 @@ index fd41b76681e3dcbedc69accd5eb3e385051817c2..c88441fa172c803e19cab3641e480b67
 +  });
 +});
 diff --git a/packages/agent-core-v2/src/app/kosongConfig/discovery.ts b/packages/agent-core-v2/src/app/kosongConfig/discovery.ts
-index f93679062b91477e4f4545c4dbc0b5f7228e8aee..72bd57816a1756f53d93060febecd93d40bf6ab7 100644
+index 20b4fcc73fbd8a01ddd3f9110194b14a8497fb1f..13d7173ecbaae35900ab4343f4402df6428894bd 100644
 --- a/packages/agent-core-v2/src/app/kosongConfig/discovery.ts
 +++ b/packages/agent-core-v2/src/app/kosongConfig/discovery.ts
 @@ -10,6 +10,7 @@ export const providerRefreshChangeSchema = z.object({
@@ -474,10 +472,10 @@ index fffa8077072b8c1362996d09787192705684b934..462c36c9670c2ed59f8a1eb9e7cff5f4
      failed: result.failed.map((failure) => ({
 diff --git a/packages/agent-core-v2/test/llm-adapter/model/closerouterRequests.test.ts b/packages/agent-core-v2/test/llm-adapter/model/closerouterRequests.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..e130f44ad296e883a6bc7c807ebe04af5cafb119
+index 0000000000000000000000000000000000000000..1bef4121fbcd1bde2276241a2f2c41a47105963d
 --- /dev/null
 +++ b/packages/agent-core-v2/test/llm-adapter/model/closerouterRequests.test.ts
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,322 @@
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 +
 +import { refreshProviderModels, type ManagedKimiConfigShape } from '@moonshot-ai/kimi-code-oauth';
@@ -485,20 +483,20 @@ index 0000000000000000000000000000000000000000..e130f44ad296e883a6bc7c807ebe04af
 +import { createScopedTestHost } from '#/_base/di/test';
 +import { IConfigService } from '#/app/config/config';
 +import { HostRequestHeadersAdapter } from '#/app/kosongConfig/hostRequestHeadersAdapter';
-+import type { Message } from '#/llm-adapter/contract/message';
++import type { Message } from '@moonshot-ai/core/llm/message';
++import { resolveThinkingEffortForModel } from '@moonshot-ai/core/llm/thinking';
++
 +import { IModelCatalog } from '#/llm-adapter/model/catalog';
 +import '#/llm-adapter/model/catalog-service';
 +import '#/llm-adapter/model/catalog-runtime';
-+import { completionBudgetParams, resolveCompletionBudget } from '#/llm-adapter/model/completion-budget';
++import { resolveCompletionBudget } from '#/llm-adapter/model/completion-budget';
 +import '#/llm-adapter/model/errors';
 +import { IHostRequestHeaders } from '#/llm-adapter/model/host-request-headers';
 +import { IModelService, type ModelsSection } from '#/llm-adapter/model/model';
 +import { IModelOAuthTokens } from '#/llm-adapter/model/model-oauth';
 +import '#/llm-adapter/model/model-service';
-+import {
-+  resolveThinkingEffortForModel,
-+  type ThinkingConfig,
-+} from '#/llm-adapter/model/thinking';
++import type { ThinkingConfig } from '#/llm-adapter/model/thinking';
++import { IProtocolAdapterRegistry } from '#/llm-adapter/protocol/protocol';
 +import '#/llm-adapter/protocol/protocolAdapterRegistry';
 +import { IProviderService, type ProvidersSection } from '#/llm-adapter/provider/provider';
 +import '#/llm-adapter/provider/provider-service';
@@ -653,6 +651,7 @@ index 0000000000000000000000000000000000000000..e130f44ad296e883a6bc7c807ebe04af
 +}
 +
 +const configs = new WeakMap<IModelCatalog, IConfigService>();
++const registries = new WeakMap<IModelCatalog, IProtocolAdapterRegistry>();
 +
 +function catalogFor(sections: ManagedKimiConfigShape): IModelCatalog {
 +  const host = createScopedTestHost([
@@ -667,12 +666,13 @@ index 0000000000000000000000000000000000000000..e130f44ad296e883a6bc7c807ebe04af
 +    ],
 +  ]);
 +  host.app.accessor.get(IProviderService).loadAll(sections.providers as ProvidersSection, undefined);
++  registries.set(host.app.accessor.get(IModelCatalog), host.app.accessor.get(IProtocolAdapterRegistry));
 +  configs.set(host.app.accessor.get(IModelCatalog), host.app.accessor.get(IConfigService));
 +  host.app.accessor.get(IModelService).loadAll(sections.models as ModelsSection, undefined);
 +  return host.app.accessor.get(IModelCatalog);
 +}
 +
-+const MESSAGES: Message[] = [{ role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [] }];
++const MESSAGES: Message[] = [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }];
 +
 +async function send(
 +  catalog: IModelCatalog,
@@ -681,19 +681,19 @@ index 0000000000000000000000000000000000000000..e130f44ad296e883a6bc7c807ebe04af
 +  requested?: string,
 +): Promise<void> {
 +  const model = catalog.get(alias);
-+  const thinkingEffort = resolveThinkingEffortForModel(requested, thinking, model);
-+  const budget = completionBudgetParams({
-+    budget: resolveCompletionBudget({ maxOutputSize: model.maxOutputSize }),
-+    capability: model.capabilities,
++  const thinkingEffort = resolveThinkingEffortForModel(requested, thinking, model.spec);
++  const budget = resolveCompletionBudget({ maxOutputSize: model.maxOutputSize });
++  const requester = registries.get(catalog)!.request(model, {
++    model: {
++      spec: model.spec,
++      thinking: { effort: thinkingEffort },
++      maxOutputTokens: budget === undefined ? undefined : Math.max(1, budget),
++    },
 +  });
-+  for await (const event of catalog.generate(
-+    alias,
-+    { systemPrompt: 'test', tools: [], messages: MESSAGES },
-+    undefined,
-+    { thinkingEffort, ...budget },
-+  )) {
-+    void event;
-+  }
++  await requester.generate(
++    { profile: { systemPrompt: 'test', tools: [] }, content: { messages: MESSAGES } },
++    { signal: new AbortController().signal },
++  );
 +}
 +
 +beforeEach(() => {
@@ -719,12 +719,12 @@ index 0000000000000000000000000000000000000000..e130f44ad296e883a6bc7c807ebe04af
 +    expect(captured[1]!.url).toBe(`${API}/chat/completions`);
 +    expect(captured[1]!.authorization).toBe('Bearer test-key');
 +    expect(captured[1]!.body).toMatchObject({ model: 'openai/gpt-6-astra', reasoning_effort: 'high', max_tokens: 32000 });
-+    expect(catalog.get('astra')).toMatchObject({
++    expect(catalog.get('astra').maxOutputSize).toBe(32000);
++    expect(catalog.get('astra').spec.thinking).toMatchObject({
 +      alwaysThinking: true,
-+      maxOutputSize: 32000,
 +      supportEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
 +    });
-+    expect(catalog.get('astra').capabilities.max_context_tokens).toBe(786432);
++    expect(catalog.get('astra').spec.maxContextSize).toBe(786432);
 +  });
 +
 +  it('encodes the endpoint-specific effort fields and limits for Chat, Responses and Messages', async () => {
@@ -752,7 +752,7 @@ index 0000000000000000000000000000000000000000..e130f44ad296e883a6bc7c807ebe04af
 +      max_tokens: 32000,
 +    });
 +    expect(captured[3]!.body).toMatchObject({ output_config: { effort: 'ultra' } });
-+    expect(catalog.get('opus').capabilities.max_context_tokens).toBe(200000);
++    expect(catalog.get('opus').spec.maxContextSize).toBe(200000);
 +  });
 +
 +  it('turns thinking off only through the mechanism each endpoint declares', async () => {
@@ -782,15 +782,15 @@ index 0000000000000000000000000000000000000000..e130f44ad296e883a6bc7c807ebe04af
 +    expect(() => {
 +      assertValidSubagentModelConfig(configs.get(offCatalog)!, offCatalog);
 +    }).not.toThrow();
-+    expect(offCatalog.get('astra').alwaysThinking).toBe(false);
-+    expect(offCatalog.get('astra').capabilities.max_context_tokens).toBe(786432);
++    expect(offCatalog.get('astra').spec.thinking?.alwaysThinking).not.toBe(true);
++    expect(offCatalog.get('astra').spec.maxContextSize).toBe(786432);
 +
 +    const high = await refreshed(withPool('high'));
 +    const highCatalog = catalogFor(high);
 +    expect(() => {
 +      assertValidSubagentModelConfig(configs.get(highCatalog)!, highCatalog);
 +    }).not.toThrow();
-+    expect(highCatalog.get('astra').alwaysThinking).toBe(true);
++    expect(highCatalog.get('astra').spec.thinking?.alwaysThinking).toBe(true);
 +
 +    const forced = catalogFor({ ...high, secondaryModel: { defaultModel: 'astra', defaultEffort: 'off' } });
 +    expect(() => {
@@ -799,10 +799,10 @@ index 0000000000000000000000000000000000000000..e130f44ad296e883a6bc7c807ebe04af
 +  });
 +});
 diff --git a/packages/klient/src/contract/global/events.ts b/packages/klient/src/contract/global/events.ts
-index d655814559a9d2c869a029a9546e00172b32026e..73c7084d6d47379d25e5bb621a39a757c0d18674 100644
+index 6c1db7894b81809cfb9903f8d7a4dde1382c000f..3aa72b2e0d24d11fb7ba7c74ea491ea284e03ce4 100644
 --- a/packages/klient/src/contract/global/events.ts
 +++ b/packages/klient/src/contract/global/events.ts
-@@ -84,6 +84,7 @@ export const catalogChangedSchema = z.object({
+@@ -77,6 +77,7 @@ export const catalogChangedSchema = z.object({
        provider_name: z.string(),
        added: z.number(),
        removed: z.number(),
@@ -811,10 +811,10 @@ index d655814559a9d2c869a029a9546e00172b32026e..73c7084d6d47379d25e5bb621a39a757
    ),
    unchanged: z.array(z.string()),
 diff --git a/packages/klient/src/contract/global/providerDiscovery.ts b/packages/klient/src/contract/global/providerDiscovery.ts
-index c02751239f1086511d2e0fa0a0cff5c2b97300a1..c3e8396f6e971eedbe67b0e9f79563c325713133 100644
+index a340f159751c77173d35f34adb022913e180d97b..5f417cec8b52d0a95d0cff0f19c705e253bc8552 100644
 --- a/packages/klient/src/contract/global/providerDiscovery.ts
 +++ b/packages/klient/src/contract/global/providerDiscovery.ts
-@@ -22,6 +22,7 @@ export const refreshProviderModelsResponseSchema = z.object({
+@@ -14,6 +14,7 @@ export const refreshProviderModelsResponseSchema = z.object({
        provider_name: z.string(),
        added: z.number(),
        removed: z.number(),
@@ -823,10 +823,10 @@ index c02751239f1086511d2e0fa0a0cff5c2b97300a1..c3e8396f6e971eedbe67b0e9f79563c3
    ),
    unchanged: z.array(z.string()),
 diff --git a/packages/node-sdk/test/sdk-rpc-client-v2.test.ts b/packages/node-sdk/test/sdk-rpc-client-v2.test.ts
-index 97590a68bbbf2d70cb75fb8703ced01c345dc109..11e7cd0b56d921341e65d3f3a95bfe75ea20ad21 100644
+index a7f5d734dc5c421e7e5c4ae4a9934e34045c9e21..b2c12f65c39b1d73d3d84c17113b1c206f7fc6fa 100644
 --- a/packages/node-sdk/test/sdk-rpc-client-v2.test.ts
 +++ b/packages/node-sdk/test/sdk-rpc-client-v2.test.ts
-@@ -1338,6 +1338,54 @@ key = "${titleOAuthRef.key}"
+@@ -2195,6 +2195,54 @@ key = "${titleOAuthRef.key}"
      }
    });
  
@@ -1649,7 +1649,7 @@ index 0000000000000000000000000000000000000000..7b3b21e76195002e4091584b887f7c5f
 +  return cause === undefined || cause === error.message ? error.message : `${error.message}: ${cause}`;
 +}
 diff --git a/packages/oauth/src/refreshProviderModels.ts b/packages/oauth/src/refreshProviderModels.ts
-index e21648f49bbe417b040dccd649c5725ba562cc39..924cb4c344429ec31f91f59d1f364ba55924fad2 100644
+index 28c271074a73dd43ccf3fb3bcf89474847d9b500..45a5c00cde778928017e5af32ad3d425c35dd219 100644
 --- a/packages/oauth/src/refreshProviderModels.ts
 +++ b/packages/oauth/src/refreshProviderModels.ts
 @@ -1,3 +1,4 @@
@@ -1657,7 +1657,7 @@ index e21648f49bbe417b040dccd649c5725ba562cc39..924cb4c344429ec31f91f59d1f364ba5
  import {
    applyCustomRegistryProvider,
    declaredUpgradeTarget,
-@@ -61,6 +62,8 @@ export interface ProviderChange {
+@@ -49,6 +50,8 @@ export interface ProviderChange {
    readonly providerName: string;
    readonly added: number;
    readonly removed: number;
@@ -1666,23 +1666,10 @@ index e21648f49bbe417b040dccd649c5725ba562cc39..924cb4c344429ec31f91f59d1f364ba5
  }
  
  export interface RefreshResult {
-@@ -422,6 +425,8 @@ function pickDefaultModel(
-  * changes through the host. Handles four provider kinds, in order:
-  *
-  *  1. Managed Kimi Code (OAuth) — `GET /models` against the runtime endpoint.
-+ *  1.5. CloseRouter — limits and endpoint efforts of the configured aliases
-+ *     whose endpoint is CloseRouter; never adds or removes aliases.
-  *  2. Open platforms (moonshot-cn, moonshot-ai, …) — platform catalog fetch.
-  *  2.5. Managed-endpoint API-key providers — hand-written `type: 'kimi'`
-  *     providers (including a hand-written `managed:kimi-code` without an oauth
-@@ -536,6 +541,32 @@ export async function refreshProviderModels(
+@@ -467,6 +470,28 @@ export async function refreshProviderModels(
      return { changed, unchanged, failed };
    }
  
-+  // ---------------------------------------------------------------------------
-+  // 1.5. CloseRouter (CustomKIMI): limits and endpoint efforts of the
-+  //      configured aliases, never the whole catalog (see ./closerouter).
-+  // ---------------------------------------------------------------------------
 +  try {
 +    const closeRouter = await refreshCloseRouterModels(host, config, { providerId: targetId });
 +    config = closeRouter.config;
@@ -1705,9 +1692,9 @@ index e21648f49bbe417b040dccd649c5725ba562cc39..924cb4c344429ec31f91f59d1f364ba5
 +    });
 +  }
 +
-   // ---------------------------------------------------------------------------
-   // 2. Open Platforms (moonshot-cn, moonshot-ai, …)
-   // ---------------------------------------------------------------------------
+   const openPlatformIds = Object.keys(config.providers).filter((id) => {
+     if (!isOpenPlatformId(id)) return false;
+     const provider = readProvider(config, id);
 diff --git a/packages/oauth/test/closerouter.test.ts b/packages/oauth/test/closerouter.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..32b3693e5872ac535fd9b6427b786066a0217887

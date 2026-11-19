@@ -1,7 +1,7 @@
-From d51c64eb33a8c40a97efd6938c323c2b293b256c Mon Sep 17 00:00:00 2001
+From cd582c9a77d72a7d557e8addba363a37ff939f8a Mon Sep 17 00:00:00 2001
 From: CustomKIMI <customkimi@localhost>
 Date: Thu, 15 Oct 2026 15:45:36 +0200
-Subject: [PATCH 05/13] customkimi: show the active provider's balance in the
+Subject: [PATCH 04/15] customkimi: show the active provider's balance in the
  web UI
 
 kimi web and /web show a small badge before the composer's model picker with the balance of the provider serving the open session's model (ClosedRouter or 7api). If a web UI update moves the picker, the badge falls back to a corner pill. kap-server gets two generic hooks: startServer({ extraRoutes, webHtmlInjection }) and an htmlInjection option on the web asset routes. The CLI registers GET /customkimi/balance-badge.js and GET /api/customkimi/balance?model=<alias> (bearer auth like every /api route), answered by the same BillingMonitor as the TUI footer. The browser script reads the web UI's stored credential and the open session's model from the public session API, and never retries a rejected credential, so it cannot trip the failed-auth rate limit.
@@ -240,10 +240,10 @@ index 0000000000000000000000000000000000000000..ff0897f1c051da698153a20eb663585c
 +  });
 +}
 diff --git a/apps/kimi-code/src/cli/sub/web/run.ts b/apps/kimi-code/src/cli/sub/web/run.ts
-index a881e534f70d1fe0ddff3fc347e0d9cfe3494eb5..fca3f9b8fb72e130faf1f6a5ca766bfb1f173b8e 100644
+index ae410e5da645e37599ac51b42da8f308580cddb0..2747c7e5509d49d665bfc7defc6af103b9d5c379 100644
 --- a/apps/kimi-code/src/cli/sub/web/run.ts
 +++ b/apps/kimi-code/src/cli/sub/web/run.ts
-@@ -23,8 +23,11 @@ import { openUrl as defaultOpenUrl } from '#/utils/open-url';
+@@ -20,6 +20,8 @@ import { openUrl as defaultOpenUrl } from '#/utils/open-url';
  import { getDataDir } from '#/utils/paths';
  import { persistedKimiOAuthRef } from '#/utils/region';
  import { generateRemoteControlQr } from '#/utils/remote-control-qr';
@@ -251,11 +251,16 @@ index a881e534f70d1fe0ddff3fc347e0d9cfe3494eb5..fca3f9b8fb72e130faf1f6a5ca766bfb
 +import { createBillingProviders } from '#/utils/billing/providers';
  
  import { initializeServerTelemetry } from '../../telemetry';
+ import { createKimiCodeHostIdentity } from '../../host-identity';
+@@ -31,6 +33,7 @@ import {
+   isLoopbackHost,
+   splitTokenFragment,
+ } from './access-urls';
 +import { BALANCE_BADGE_HTML, registerBalanceBadge } from './balance-badge';
+ import { type NetworkAddress } from './networks';
  import {
-   createKimiCodeHostIdentity,
-   getHostPackageRoot,
-@@ -375,6 +378,8 @@ async function runServerInProcess(
+   formatRemoteControlOutput,
+@@ -404,6 +407,8 @@ async function runServerInProcess(
        'dev mode: web assets not built; starting the API server without the web UI',
      );
    }
@@ -264,8 +269,8 @@ index a881e534f70d1fe0ddff3fc347e0d9cfe3494eb5..fca3f9b8fb72e130faf1f6a5ca766bfb
    const v2 = await startServer({
      host: options.host,
      port: options.port,
-@@ -403,12 +408,20 @@ async function runServerInProcess(
-     // only covers host-level events.
+@@ -426,13 +431,21 @@ async function runServerInProcess(
+     managedBy: options.managedBy,
      telemetry: true,
      webAssetsDir,
 +    // CustomKIMI: the provider balance badge next to the web UI's model picker.
@@ -276,7 +281,8 @@ index a881e534f70d1fe0ddff3fc347e0d9cfe3494eb5..fca3f9b8fb72e130faf1f6a5ca766bfb
    });
    logger.info('serving the REST/WS API and the bundled web UI');
    running = {
-     address: `http://${v2.host}:${v2.port}`,
+     address:
+       options.socketPath === undefined ? `http://${v2.host}:${v2.port}` : `unix:${options.socketPath}`,
      logger,
 -    close: () => v2.close(),
 +    close: () => {
@@ -461,10 +467,10 @@ index e453593171b2b1ae3abf51f1243477d437b7b013..78eac85ed8eafdf85477506ecc19464d
    const assetPath = relative(assetsDir, filePath);
    const fileName = filePath.slice(filePath.lastIndexOf(sep) + 1);
 diff --git a/packages/kap-server/src/start.ts b/packages/kap-server/src/start.ts
-index a69c1b744c24b1322f7393f0a6b42cedcff93a7f..cf8f568ed24f2da95e3b8c2fd08ca7b8f9d6d6c4 100644
+index ee32f173b54c320f3ff1445706489921a6bf9cc4..12334a0fbda46e1fc9f2332e451aa3bd6e4afa54 100644
 --- a/packages/kap-server/src/start.ts
 +++ b/packages/kap-server/src/start.ts
-@@ -126,6 +126,8 @@ export interface ServerStartOptions {
+@@ -135,6 +135,8 @@ export interface ServerStartOptions {
    readonly hostIdentity: ServerHostIdentity;
    readonly skillDirs?: readonly string[];
    readonly webAssetsDir?: string;
@@ -472,8 +478,8 @@ index a69c1b744c24b1322f7393f0a6b42cedcff93a7f..cf8f568ed24f2da95e3b8c2fd08ca7b8
 +  readonly extraRoutes?: (app: FastifyInstance) => Promise<void> | void;
    readonly serverVersion?: string;
    readonly telemetry?: boolean;
- }
-@@ -602,8 +604,10 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
+   readonly socketPath?: string;
+@@ -673,8 +675,10 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
      return reply.type('application/json').send(openApiDocument);
    });
  

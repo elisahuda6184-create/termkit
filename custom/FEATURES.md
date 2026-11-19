@@ -10,17 +10,16 @@ If a patch stops applying after a new release, re-create the behavior described 
 
 CloseRouter returns the exact USD cost of every request in `usage.cost`. Official Kimi drops that field. This patch keeps it and adds it up per session.
 
-- `packages/agent-core-v2/src/human/llm/usage.ts`: `TokenUsage` has `cost?: number`. `addUsage` sums it; the sum is unknown (undefined) as soon as either side lacks a reported cost (patch 0007 — a request without a cost must not count as $0). `mergeUsagePatch` keeps it.
-- `packages/agent-core-v2/src/human/llm/requester/bases/{anthropic,openai,openai-responses}/`: `contract.ts` declares `cost` on the raw usage type, and `format.ts` copies `usage.cost` into `TokenUsage.cost` when it is a finite number (anything else counts as unreported).
-- `packages/agent-core-v2/src/human/usage/usage.ts`: the human-layer usage summary (not used by the v2 runtime) adds up `cost` where it is reported.
+- `packages/core/src/llm/usage.ts`: `TokenUsage` has `cost?: number`. `addUsage` sums it; the sum is unknown (undefined) as soon as either side lacks a reported cost (patch 0006 — a request without a cost must not count as $0). `mergeUsagePatch` keeps it.
+- `packages/core/src/llm/builtin/protocol/{anthropic,openai,openai-responses}/`: `contract.ts` and `decode.ts` declare `cost` on the raw usage type, and `decode.ts` copies `usage.cost` into `TokenUsage.cost` when it is a finite number (anything else counts as unreported).
 - `packages/node-sdk/src/types.ts`: the SDK `TokenUsage` has `readonly cost?: number`.
 - `packages/agent-core-v2/docs/state-manifest.d.ts`: generated file, regenerated for the new field. If it conflicts, take upstream's version and run `corepack pnpm -C packages/agent-core-v2 run gen:state-manifest`.
 
-Tests: agent-core-v2 `src/human/test/llm/usage.test.ts`, `src/human/test/usage/machine.test.ts`, `test/llm-adapter/contract/usage-tokens.test.ts`; node-sdk `test/session-event-wiring.test.ts`.
+Tests: agent-core-v2 `test/llm-adapter/contract/usage-tokens.test.ts`; node-sdk `test/session-event-wiring.test.ts`.
 
 ## 2. Provider balance and session cost in the footer (`0002-…`)
 
-The footer's second line shows, before the context usage, the balance of the provider serving the active model and the cost of the current session, for example `7api balance $9.18  session cost $0.0123`. Since patch 0007 the session cost covers every agent of the session (see feature 7). The balance follows the active model (ClosedRouter, 7api or OpenRouter, see feature 8). When the terminal is too narrow, the cost is dropped first, then the balance. A `usage` slot with the same values is available to `status_line` templates. Requires feature 1.
+The footer's second line shows, before the context usage, the balance of the provider serving the active model and the cost of the current session, for example `7api balance $9.18  session cost $0.0123`. Since patch 0006 the session cost covers every agent of the session (see feature 7). The balance follows the active model (ClosedRouter, 7api or OpenRouter, see feature 8). When the terminal is too narrow, the cost is dropped first, then the balance. A `usage` slot with the same values is available to `status_line` templates. Requires feature 1.
 
 Code in `apps/kimi-code/src/utils/billing/`:
 
@@ -71,13 +70,11 @@ Tests (apps/kimi-code): `test/utils/billing/billing-providers.test.ts`, `test/ut
 
 Tests: none; the typecheck catches API changes. For example, Kimi Code 2.3.0 renamed `waitForLazyCreation()`, which the handler awaits first, to `waitForSessionAssembly()`; it now also waits for a `/new` session that is still being created.
 
-## 4. node-pty permission fix (`0004-…`)
+## 4. node-pty permission fix (dropped in the 2.7.0 update)
 
-`pnpm install` runs `scripts/fix-node-pty-perms.mjs` to make node-pty's `spawn-helper` binaries executable. node-pty needs them to start terminal processes on macOS. Upstream resolves node-pty from `packages/services`, which does not exist, so the helpers stay non-executable. This patch resolves node-pty from `packages/agent-core-v2` and `apps/kimi-code`, relative to the script. Drop this patch once upstream fixes the path.
+Upstream 2.7.0 removed `scripts/fix-node-pty-perms.mjs` and the CLI's node-pty dependency (node-pty remains only in the desktop app, with its own rebuild script), so this patch no longer exists. The old patch made the script resolve node-pty from the workspace packages that declare it; its last version is in `history/2.3.1/`. The features after this one kept their numbers above, so from feature 5 on, the patch file number is one less than the feature number.
 
-Check: `pnpm install` must not print `[fix-node-pty-perms] skipped: …`, which means node-pty was not found. It prints `made N spawn-helper binary(ies) executable` when it fixes something, and nothing when the helpers are already executable.
-
-## 5. Provider balance in the web UI (`0005-…`)
+## 5. Provider balance in the web UI (`0004-…`)
 
 `kimi web` and `/web` show the balance of the provider serving the open session's model, for example `7api $6.72`, just before the model picker under the message box. If a web UI update moves the picker, the badge falls back to a small pill in the bottom-right corner. It refreshes every minute and whenever the session or model changes. Requires feature 2.
 
@@ -107,7 +104,7 @@ Notes for future updates:
 
 Tests: kap-server `test/webAssetsInjection.test.ts`; apps/kimi-code `test/cli/web/balance-badge.test.ts`.
 
-## 6. CloseRouter model limits and efforts (`0006-…`)
+## 6. CloseRouter model limits and efforts (`0005-…`)
 
 When Kimi starts (and every 6 hours while `kimi web` runs), the configured CloseRouter aliases are refreshed from CloseRouter itself, so context limits, output limits and reasoning efforts follow what the endpoint each alias is called through supports. Only aliases that already exist are updated; the catalog is never imported and no alias, provider or setting is added or removed.
 
@@ -131,7 +128,7 @@ Pin a value with `[models."<alias>".overrides]`; overrides win at runtime and ar
 
 Tests: oauth `test/closerouter.test.ts`; agent-core-v2 `test/llm-adapter/model/closerouterRequests.test.ts` (refresh → model → captured HTTP bodies, and `[secondary_model]` validation); node-sdk `test/sdk-rpc-client-v2.test.ts` (a stubbed CloseRouter refresh through the real harness keeps `detail`); apps/kimi-code `test/tui/utils/thinking-config.test.ts`, `test/tui/kimi-tui-startup.test.ts` (the lazy footer at startup and after a refresh, and the live-session re-read, with the engine's refresh mocked).
 
-## 7. Session cost of every agent (`0007-…`)
+## 7. Session cost of every agent (`0006-…`)
 
 The footer's session cost includes the main agent, foreground, background and nested subagents, including finished ones and those of earlier runs of a resumed session. Each agent is counted once; the context meter stays the main agent's own.
 
@@ -142,7 +139,7 @@ The footer's session cost includes the main agent, foreground, background and ne
   - If session metadata or a journal cannot be read, or a usage record is malformed, the snapshot becomes empty, which hides the cost rather than showing a partial one, and an update is sent.
   - A damaged journal (a line that is not valid JSON) is different: like the engine's own repair, it is read up to its first bad line. A last line cut off by a crash loses nothing, but usage recorded after a bad line in the middle is not counted, so the cost shown is lower. Only a warning is logged.
   - `ready` never rejects. `onDidChange` fires once after the restore and whenever the snapshot changes afterwards, including background subagents that spend after the main turn ended.
-- `packages/agent-core-v2/src/human/llm/usage.ts`: `addUsage` keeps the cost unknown when either side lacks one (see feature 1).
+- `packages/core/src/llm/usage.ts`: `addUsage` keeps the cost unknown when either side lacks one (see feature 1). A durable record without `inputCacheRead` (unknown cache reads) is valid when restoring.
 - `packages/klient/src/contract/agent/schemas.ts`: `tokenUsageSchema` carries `cost`, so `getStatus().usage` keeps it on resume.
 - `packages/node-sdk/src/types.ts`: `SessionStatus.billingUsage`. `src/sdk-rpc-client-v2.ts`: `getStatus()` waits for `ready` first, then reads every slice. `src/v2/session-wiring.ts`: forwards `onDidChange` as an `agent.status.updated` event of the main agent that carries the main agent's own snapshot (usage, context, model) like every status event, plus `billingUsage`. `agent-core-v2/src/agent/usage/usageEvents.ts`: the field on `AgentStatusUpdatedEvent`.
 - `apps/kimi-code/src/tui/types.ts`: `AppState.billingUsage`. `controllers/session-event-handler.ts` stores it before child events are routed away; `kimi-tui.ts` sets it from `getStatus()` (unless a newer billing event arrived meanwhile) and clears it when switching sessions; `components/chrome/footer.ts` prices `billingUsage ?? sessionUsage`.
@@ -154,9 +151,9 @@ Known limits:
 - Agents are found through the session metadata, not by listing the `agents/` folder.
 - `billingUsage` is `{}` both before anything is spent and while the cost cannot be fully accounted for; the footer shows no cost in either case.
 
-Tests: agent-core-v2 `test/agent/usage/sessionBilling.test.ts` (its test agents register an in-memory session lock and a session context, because since 2.3.0 an agent's wire journal is written only while its process holds the session lock), `test/llm-adapter/contract/usage-tokens.test.ts`, `src/human/test/llm/usage.test.ts`; node-sdk `test/session-billing.test.ts` (real subagents through a stubbed endpoint, live and after a restart), `test/session-event-wiring.test.ts`; apps/kimi-code `test/tui/components/chrome/footer.test.ts`, `test/tui/controllers/session-event-handler-compaction.test.ts`, `test/tui/kimi-tui-startup.test.ts`.
+Tests: agent-core-v2 `test/agent/usage/sessionBilling.test.ts` (its test agents register an in-memory session lock and a session context, because since 2.3.0 an agent's wire journal is written only while its process holds the session lock), `test/llm-adapter/contract/usage-tokens.test.ts`; node-sdk `test/session-billing.test.ts` (real subagents through a stubbed endpoint, live and after a restart), `test/session-event-wiring.test.ts`; apps/kimi-code `test/tui/components/chrome/footer.test.ts`, `test/tui/controllers/session-event-handler-compaction.test.ts`, `test/tui/kimi-tui-startup.test.ts`.
 
-## 8. OpenRouter balance and session cost (`0008-…`)
+## 8. OpenRouter balance and session cost (`0007-…`)
 
 OpenRouter is the third billing provider, after ClosedRouter and 7api. When the active model's base URL is on `openrouter.ai` (for example `https://openrouter.ai/api/v1`), the footer shows `OpenRouter balance $X  session cost $Y` and the `kimi web` badge shows `OpenRouter $X`. It is active only when `OPENROUTER_API_KEY` is set. Requires features 1, 2 and 5.
 
@@ -190,7 +187,7 @@ Tests: apps/kimi-code `test/utils/billing/billing-providers.test.ts` covers:
 
 Keys: store them with `security add-generic-password -U -a "$USER" -s OPENROUTER_API_KEY -w` and `… -s OPENROUTER_MANAGEMENT_KEY -w`. The `kimi` function in `~/.zshrc` exports only `OPENROUTER_API_KEY`.
 
-## 9. OpenRouter model limits and efforts (`0009-…`)
+## 9. OpenRouter model limits and efforts (`0008-…`)
 
 When Kimi starts (and every 6 hours while `kimi web` runs), Kimi refreshes the configured OpenRouter aliases from OpenRouter's public model catalog. Like feature 6 for CloseRouter, this keeps context limits, output limits and reasoning efforts in line with what OpenRouter reports. It only updates aliases that already exist. It never imports the catalog and never adds or removes an alias, provider or setting. It never uses an API key.
 
@@ -239,22 +236,22 @@ Pin a value with `[models."<alias>".overrides]`. To opt a provider out of every 
 
 Requires feature 6, whose helpers it reuses. Tests: oauth `test/openrouter.test.ts`; `test/closerouter.test.ts` must keep passing unchanged.
 
-## 10. Bounded retries for HTTP 524 (`0010-…`)
+## 10. Bounded retries for HTTP 524 (`0009-…`)
 
 Provider HTTP 524 gateway timeouts use the existing transient-error retry path instead of immediately failing the turn and pausing an active goal. No automatic "Continue" prompt is injected, and no infinite-retry setting is enabled.
 
-- `packages/agent-core-v2/src/human/llm/requester/retry.ts`: includes 524 in the turn retry policy. Retries keep the existing attempt limit (10 total attempts per step by default), exponential backoff with jitter, `Retry-After` handling, and cancellation. `[loop_control].max_attempts_per_step` can override the limit.
-- `packages/agent-core-v2/src/llm-adapter/contract/errors.ts`: includes 524 in `isRetryableGenerateError`, keeping compaction retries and telemetry classification consistent.
+- `packages/core/src/llm/protocol/rules/status.ts`: `isTransientHttpStatus` includes 524, so every protocol decoder marks it retryable and the turn retry policy picks it up. Retries keep the existing attempt limit (10 total attempts per step by default), exponential backoff with jitter, `Retry-After` handling, and cancellation. `[loop_control].max_attempts_per_step` can override the limit.
+- `packages/agent-core-v2/src/llm-adapter/contract/errors.ts`: `isRetryableGenerateError` classifies `APIStatusError` by the same `isTransientHttpStatus` (524 included; quota-exhausted stays non-retryable), keeping compaction retries and telemetry classification consistent.
 - Only the failed model step is retried. If all attempts fail, the turn still fails and the goal pauses normally; authentication, request validation, quota and safety failures retain their existing handling.
 - This is recovery from a provider timeout, not a change to the provider's own timeout. A timed-out request can still have consumed provider resources before a retry.
 - `apps/kimi-code/src/tui/controllers/session-event-handler.ts`: each scheduled turn retry prints a plain status line, for example `System notice: Model request failed (HTTP 524). Retrying attempt 2/10 in 1s.` Pending stream output is flushed before the notice. `types.ts`, `components/messages/status-message.ts` and `kimi-tui.ts` carry `preserveWhenFolding` so these lines remain visible during long-turn and completed-turn folding. The existing live retry indicator remains.
-- `packages/kap-server/src/services/transcript/coreEventMap.ts`: each turn retry adds a display-only, labelled text frame for the prebuilt web UI (its notice frames are ignored and notice markers are only toasts). The line stays in the live chat after recovery, without changing model context or exposing raw provider error bodies. Stable retry frame IDs avoid duplication in the web transcript; stream-frame adoption skips these lines. This does not reconstruct retry lines in cold history after a server/session restart.
+- `packages/kap-server/src/services/conversation/conversationFold.ts` (with `retryNoticeItem` in `conversationItems.ts`): each turn retry adds a display-only `assistant_message` item with the same text for the web UI. The line stays in the chat after recovery, without changing model context or exposing raw provider error bodies. Its stable item ID (`<step>:retry-<attempt>`) makes a duplicate event replace the item instead of duplicating it, and because the ID contains `:` the failed-attempt cleanup removes it together with the failed step's own items when the step is retried.
 
-Tests: agent-core-v2 `src/human/test/agent/turn.test.ts` (524 recovery, bounded exhaustion and cancellation during backoff), `test/app/llmProtocol/errors.test.ts` (524 classification and unchanged non-retryable errors); node-sdk `test/session-prompt-events.test.ts` (real goal session with a stubbed HTTP 524: completes without pausing, preserves retry messages and does not replay completed tools); apps/kimi-code `test/tui/controllers/session-event-handler-step-retry.test.ts` (chat status entry survives retry completion), `test/tui/kimi-tui-message-flow.test.ts` (retry notices survive folding and follow buffered thinking); kap-server `test/services/transcript.test.ts` (visible retry lines, duplicate events, non-HTTP failures and separate model text).
+Tests: agent-core-v2 `test/app/llmProtocol/errors.test.ts` (524 classification and unchanged non-retryable errors); node-sdk `test/session-prompt-events.test.ts` (real goal session with a stubbed HTTP 524: completes without pausing, preserves retry messages and does not replay completed tools); apps/kimi-code `test/tui/controllers/session-event-handler-step-retry.test.ts` (chat status entry survives retry completion), `test/tui/kimi-tui-message-flow.test.ts` (retry notices survive folding and follow buffered thinking); kap-server `test/services/conversation.test.ts` (visible retry lines, duplicate events, non-HTTP failures and separate model text).
 
 Restart existing Kimi processes after rebuilding to load the changed engine.
 
-## 11. Per-model extra request fields (`0011-…`)
+## 11. Per-model extra request fields (`0010-…`)
 
 A model alias can carry an `extra_body` table. Its fields are added at the top level of every OpenAI Chat Completions or Responses request for that alias. Use it for provider options Kimi has no setting for, such as OpenRouter's provider routing:
 
@@ -270,15 +267,15 @@ allow_fallbacks = false
 - When you pin one OpenRouter provider, put that provider's limits under `overrides`. Feature 9 writes the model-wide limits; for `qwen/qwen3.8-27b` those are 1,000,000 context and 235,929 output, while Cerebras serves 65,536 and 32,768.
 - `packages/agent-core-v2/src/app/kosongConfig/configSection.ts`: `extraBody` in the model schema (omitted from `overrides`). `docs/config-manifest.toml` is regenerated.
 - `llm-adapter/model/model.ts`: `ModelRecord.extraBody`. `llm-adapter/protocol/protocol.ts` and `llm-adapter/model/catalog-service.ts`: carried in `providerOptions` for the `openai` and `openai_responses` protocols.
-- `llm-adapter/model/model-requester-impl.ts`: passed as `LlmRequestConfig.extraBody` (`human/llm/requester/requester.ts`).
-- `human/llm/requester/bases/openai/format.ts` and `bases/openai-responses/format.ts`: spread first when the request body is assembled.
+- `llm-adapter/protocol/protocolAdapterRegistry.ts`: passes it as the core protocol binding's `extraBody` option (`OpenAIOptions` / `OpenAIResponsesOptions` in `packages/core/src/llm/builtin/protocol/{openai,openai-responses}/index.ts`) and folds it into the requester's recovery key.
+- `packages/core/src/llm/builtin/protocol/{openai,openai-responses}/lower.ts`: each `flatten` merges it under the request Kimi built (`withExtraBody` in `packages/core/src/llm/protocol/kit/params.ts` — Kimi's own defined fields win), before the protocol `extras` are applied on top.
 - This is separate from upstream's internal `extraParams.openai.extra_body`, which a plain OpenAI request still sends literally as an `extra_body` field.
 
-Tests: agent-core-v2 `test/app/model/model.test.ts` (TOML round trip keeps nested keys verbatim), `test/llm-adapter/model/catalog.test.ts` (`providerOptions` for the OpenAI wires only), `test/llm-adapter/model/modelRequester.test.ts` (sent with every request), `src/human/test/llm/response-format.test.ts` (top-level fields on Chat and Responses requests; Kimi's `model`, `stream` and `reasoning_effort` win).
+Tests: agent-core-v2 `test/app/model/model.test.ts` (TOML round trip keeps nested keys verbatim), `test/llm-adapter/model/catalog.test.ts` (`providerOptions` for the OpenAI wires only); core encode fixtures `test/llm/openai/fixtures/encode/extra-body.ts` and `test/llm/openai-responses/fixtures/encode/extra-body.ts` (top-level fields on Chat and Responses requests; Kimi's `model`, `reasoning_effort` and `store` win).
 
-Known unrelated failure: agent-core-v2 `test/tool/tool.test.ts` "returns the spawned agent id when a foreground subagent times out" fails (30 s test timeout) with and without patches 0010 and 0011. `update.sh` does not run it, because no patch touches that file.
+Known unrelated failure: agent-core-v2 `test/tool/tool.test.ts` "returns the spawned agent id when a foreground subagent times out" fails (30 s test timeout) with and without patches 0009 and 0010. `update.sh` does not run it, because no patch touches that file.
 
-## 12. Context window in the `/model` picker (`0012-…`)
+## 12. Context window in the `/model` picker (`0011-…`)
 
 Every row of the `/model` picker shows the model's context window in a right-aligned column between the model name and the provider, so models can be compared before picking:
 
@@ -301,9 +298,9 @@ Every row of the `/model` picker shows the model's context window in a right-ali
 
 Tests: apps/kimi-code `test/utils/usage/usage-format.test.ts` (decimal, binary and rounded cases), `test/tui/components/dialogs/model-selector.test.ts` (aligned column, overrides), `test/tui/components/panels/footer-context.test.ts` (`120k/1M`), and the updated picker expectations in `test/tui/kimi-tui-message-flow.test.ts`.
 
-## 13. Agent dock under the conversation (`0013-…`)
+## 13. Agent dock under the conversation (`0012-…`)
 
-Every subagent of the session is listed as a row right under the conversation (above the Todo / Updates panels and the editor), led by a status dot: it pulses while the agent runs, turns green (`· done`) when it completed and red (`· failed`) when it failed. A row shows the agent name, its description, model, effort, how many tools it has used, the elapsed time and, while running, the tool it is on right now (for example `Bash ls src`). Finished rows stay for 8 seconds (failed ones 20 seconds) and then leave the list; a foreground agent of an aborted turn is marked `· ended`.
+Every subagent of the session is listed as a row right under the conversation (above the Updates panel and the editor; upstream removed its Todo panel in 2.7.0), led by a status dot: it pulses while the agent runs, turns green (`· done`) when it completed and red (`· failed`) when it failed. A row shows the agent name, its description, model, effort, how many tools it has used, the elapsed time and, while running, the tool it is on right now (for example `Bash ls src`). Finished rows stay for 8 seconds (failed ones 20 seconds) and then leave the list; a foreground agent of an aborted turn is marked `· ended` (upstream's `cancelled` activity status maps to it too).
 
 Keys: `↓` on an empty editor moves into the dock (the dim `↓ agents` hint under the rows says so), `↑`/`↓` move the selection, `Esc` goes back to the editor, and `↓` past the last row does too. `Enter` shows the selected agent's conversation **in place of the main chat**, in the chat's own shape: the task prompt the parent gave the agent as a user message (`❯ …`), then its assistant text (Markdown) and tool calls through the main-flow renderers, a `⠸ coder is working…` line while it runs and `✓ coder finished` / `✗ coder failed` with the result at the end. The dock, editor and footer stay where they are; a muted `agent coder › lister · model · effort` line on top marks it. While an agent is shown, `↑`/`↓` switch to another agent and `Enter`/`Esc` bring the main chat back (the dock keeps the focus; `Esc` again returns to the editor). The upstream inline agent card and `/tasks` are unchanged; the dock is an addition.
 
@@ -315,11 +312,11 @@ Keys: `↓` on an empty editor moves into the dock (the dim `↓ agents` hint un
 - `apps/kimi-code/src/tui/tui-state.ts`, `kimi-tui.ts`: the `agentDockContainer` placed after the activity container in the regular layout, the fullscreen dock and the exit replay; the controller is reset with the session runtime (`resetSessionRuntimeState`) and disposed in `stop()`.
 - `apps/kimi-code/src/tui/controllers/editor-keyboard.ts`: `onDownArrowEmpty` tries the dock first (`focusFromEditor()`), then the `/btw` panel as before.
 
-The feature was written on Kimi Code 2.2.0 and merged onto 2.3.1 with `git am --3way` without conflicts; upstream's 2.3.x changes to `kimi-tui.ts` and `subagent-event-handler.ts` did not touch these lines.
+The feature was written on Kimi Code 2.2.0, merged onto 2.3.1, and re-landed on 2.7.0, whose fullscreen layout needs a real `TranscriptContainer` inside `TranscriptView` for the conversation swap.
 
 Tests: apps/kimi-code `test/tui/components/chrome/agent-dock.test.ts`, `test/tui/components/messages/agent-conversation.test.ts`, the `subscribe` case in `test/tui/controllers/subagent-activity-store.test.ts`.
 
-## 14. Muse subscription usage (`0014-…`)
+## 14. Muse subscription usage (`0013-…`)
 
 The muse provider (`[providers.muse]` in `config.toml`: `api_key_env = "MUSE_FORWARDER_KEY"`, base URL `https://<host>:8788/v1`) is a subscription, not a prepaid balance. The forwarder's `GET /usage` reports how much of the weekly quota and of the short rolling window (5 hours) is used, when each resets, the token counts and the request count. This feature shows that next to the dollar balances of features 2, 5 and 8 without touching them.
 
@@ -346,7 +343,7 @@ Code:
 
 Tests (apps/kimi-code): `test/utils/billing/muse-usage.test.ts`, the `Muse usage panel` cases in `test/tui/components/messages/usage-panel.test.ts`, the `web muse usage route` cases in `test/cli/web/balance-badge.test.ts`.
 
-## 15. Gemini forwarder usage (`0015-…`)
+## 15. Gemini forwarder usage (`0014-…`)
 
 The gemini provider (`[providers.gemini]` in `config.toml`, base URL `https://<host>:8790/v1`) is a second relay next to muse. Its `GET /usage` has the muse forwarder's shape on purpose, so this feature extends feature 14 to both instead of adding a parallel one. It changes these things in feature 14:
 
@@ -375,13 +372,13 @@ Not a patch: the gemini provider and its six model aliases are configuration (`c
 
 Tests (apps/kimi-code): the gemini cases in `test/utils/billing/muse-usage.test.ts` (`parseMuseUsage`, `museUsageForModel`, `configuredMuseEndpoints`, `toQuotaRows`), the gemini cases of `Muse usage panel` in `test/tui/components/messages/usage-panel.test.ts`, and in `test/cli/web/balance-badge.test.ts` the gemini route case and `the badge script names the pill after the forwarder that answered`, which runs the browser script against a stub page.
 
-## 16. Gemini filter retry (`0016-…`)
+## 16. Gemini filter retry (`0015-…`)
 
-Gemini sometimes refuses a harmless request with `This request was blocked by Gemini's filters. They can occasionally trigger by mistake on safe coding, security, or biology-related queries. Please try rephrasing your prompt. …`. Instead of stopping there, the agent sends a random "continue" prompt and keeps going in the same turn.
+Gemini sometimes refuses a harmless request with `This request was blocked by Gemini's filters. They can occasionally trigger by mistake on safe coding, security, or biology-related queries. Please try rephrasing your prompt. …`. Instead of stopping there, the agent sends a random "continue" prompt and keeps going: a failed request is retried inside its step; a blocked reply continues as a follow-up turn (since 2.7.0 a notification cannot extend the running turn).
 
 - It triggers when the reply is that notice (a short reply, at most 800 characters, containing `blocked by Gemini's filters` or `can occasionally trigger by mistake on safe coding`), when a request fails with an error that contains it, and, on a Gemini model only (alias, provider or model name contains `gemini`), when the provider cuts the reply off with `finishReason=filtered`. A long reply that merely quotes the notice does not count.
 - The prompt is picked from spintax templates, e.g. `Keep at it, please! Continue where you left off.`, `What's going on? Kindly pick it back up from there!`, `You stopped there! Please pick up with the work`.
-- At most 5 retries per turn; the 6th block stops the turn with a warning. The count restarts with the next prompt.
+- At most 5 retries in a row; the 6th block stops with a warning. The count restarts with the next genuine prompt (turns opened by a retry prompt itself do not reset it).
 - Every retry shows `Warning: Gemini's filter blocked the reply; retrying automatically (1/5) with "<prompt>"` in the main conversation (CLI and web). The prompt is saved in the history with origin `system_trigger` / `gemini_filter_retry`, so the transcript does not show it as a user message. Subagent warnings are not drawn in the subagent's card yet.
 - Subagents retry inside their own run, so the parent receives the real answer, not the notice.
 - Setting: top-level `gemini_filter_retry` in `config.toml`: `true` (default, every agent), `"subagents"` (subagents only; the main conversation stops on the notice) or `false` (off). `/settings` → **Gemini filter retry** offers On / Subagents only / Off and writes it; a change applies to running sessions at the next step.
@@ -389,9 +386,9 @@ Gemini sometimes refuses a harmless request with `This request was blocked by Ge
 Code:
 
 - `packages/agent-core-v2/src/features/geminiFilterRetry/`: `geminiFilterRetry.ts` (config section `geminiFilterRetry`, notice detection, `geminiFilterRetryAppliesTo()`, spintax), `geminiFilterRetryService.ts` (agent service), `geminiFilterRetryFeature.ts`; registered in `src/index.ts`; `docs/config-manifest.toml` regenerated.
-  - A blocked **reply** is handled in an `onDidFinishStep` hook: the service calls `IAgentLoopService.notify()` with the continue message (turn-scoped), which keeps the turn running.
-  - A failed **request** is handled through `IAgentLoopService.registerLlmRecovery()`: the turn machine's recovery proposal re-runs the step (before its plain same-request retries), and the loop appends the continue message after it closes the failed step. v2 builds every request from context memory, so a recovery cannot use `attemptMessageOverride`; it returns `appendMessages` instead.
-- `packages/agent-core-v2/src/agent/loop/loop.ts`, `loopService.ts`: the `registerLlmRecovery` seam (`LoopLlmRecovery`, passed to the machine engine as `recovery`, appended on the `recovering` event). `turn.filtered` now follows the last step, and a live nudge keeps a filtered step from failing the turn.
+  - A blocked **reply** is handled in an `onDidFinishStep` hook: the service calls `IAgentLoopService.notify()` with the continue message, which the loop takes as the next turn.
+  - A failed **request** is handled through `IAgentLoopService.registerLlmRecovery()`: the loop service adapts each registered recovery into a core `LlmRecovery` at the head of the request policy's recovery list, so its proposal runs before the plain same-request retries. The proposal's `appendMessages` are rewritten into the retried request, journaled with `ContextAppendMessage` before the next attempt, and spliced into the loop history (before the step's reply, or at the end when the step fails) when the step finishes.
+- `packages/agent-core-v2/src/agent/loop/loop.ts`, `loopService.ts`: the `registerLlmRecovery` seam (`LoopLlmRecovery` with `appendMessages`). `packages/agent-core-v2/src/agent/loop/turnProjection.ts`: `turn.filtered` follows the last step, so a step recovered by a retry no longer fails the turn. `packages/agent-core-v2/src/agent/loop/journal.ts`: the journal accepts the `llm-recovery` context-settle reason (live splice only; the dispatched appends carry persistence).
 - `packages/node-sdk/src/config/schema.ts`, `config/toml.ts`, `v2/config-mapper.ts`, `packages/kap-server/src/protocol/rest-config.ts`: the `geminiFilterRetry` / `gemini_filter_retry` key (`boolean | "subagents"`).
 - `apps/kimi-code/src/tui/components/dialogs/settings-selector.ts`, `gemini-filter-retry-selector.ts`, `src/tui/commands/config.ts` (`showGeminiFilterRetryPicker`, `applyGeminiFilterRetryChoice`).
 
@@ -408,7 +405,7 @@ Tests: `packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry
 
 The update then rewrites `patches/` from the resolved code, so the next release starts from the fixed version.
 
-Every patch can apply and the typecheck or a test still fail, for example because upstream renamed something a patch uses. In that case, fix it in `source.next` and fold the fix into the commit of the feature it belongs to, so that each feature stays one patch. Run `git commit --fixup=<that feature's commit>`, then `git rebase --autosquash "@moonshot-ai/kimi-code@<version>"`, then `sh scripts/update.sh --continue`.
+Every patch can apply and the typecheck or a test still fail, for example because upstream renamed something a patch uses. In that case, fix it in `source.next` and fold the fix into the commit of the feature it belongs to, so that each feature stays one patch. Run `git commit --fixup=<that feature's commit>`, then `git rebase --autosquash "@moonshot-ai/kimi-code@<version>"`, then `sh scripts/update.sh --continue`. Since 2.7.0 the repository's husky hooks reject the comments the older custom code carries, so pass `--no-verify` to the fixup commits and run the rebase with `HUSKY=0` — the same bypass `git am` gets. If a rebase stops midway, do not run `--save` until it has finished.
 
 ## Changing or adding a feature
 

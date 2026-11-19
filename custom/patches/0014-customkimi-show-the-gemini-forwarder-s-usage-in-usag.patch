@@ -1,7 +1,7 @@
-From 03a29a1cc70b4d37a0a3eacc0a322d8992484b72 Mon Sep 17 00:00:00 2001
+From c69243a283ad90903ab9f5daac179619884c206f Mon Sep 17 00:00:00 2001
 From: CustomKIMI <customkimi@localhost>
 Date: Mon, 16 Nov 2026 16:36:42 +0700
-Subject: [PATCH 15/15] customkimi: show the gemini forwarder's usage in /usage
+Subject: [PATCH 14/15] customkimi: show the gemini forwarder's usage in /usage
  and the web UI
 
 The gemini forwarder's GET /usage has the muse forwarder's shape, so the
@@ -108,7 +108,7 @@ index 10c9b747c25de8689fb88d840aed621a47647cce..176c622f24dbae5e46754ed81122768e
      return usage;
    };
 diff --git a/apps/kimi-code/src/tui/commands/info.ts b/apps/kimi-code/src/tui/commands/info.ts
-index 8122b046678395ef515070cc6ded8cdc20aaca88..08214a989055c074f0f4afc60f4ef884d6485c06 100644
+index 2a58876dac38d08a5ce465e70eb0b416d88b1ead..3c6cfb39d7ed81ed5368bfb6b47ab909052492d5 100644
 --- a/apps/kimi-code/src/tui/commands/info.ts
 +++ b/apps/kimi-code/src/tui/commands/info.ts
 @@ -11,7 +11,7 @@ import {
@@ -120,7 +120,7 @@ index 8122b046678395ef515070cc6ded8cdc20aaca88..08214a989055c074f0f4afc60f4ef884
  import { quotaUsageRows } from '#/utils/usage/usage-format';
  import {
    FEEDBACK_ISSUE_URL,
-@@ -153,17 +153,17 @@ interface ManagedUsageResult {
+@@ -151,17 +151,17 @@ interface ManagedUsageResult {
  }
  
  interface MuseUsageResult {
@@ -142,7 +142,7 @@ index 8122b046678395ef515070cc6ded8cdc20aaca88..08214a989055c074f0f4afc60f4ef884
    ]);
    const reportArgs = {
      sessionUsage: sessionUsage.usage,
-@@ -176,10 +176,10 @@ export async function showUsage(host: SlashCommandHost): Promise<void> {
+@@ -174,10 +174,10 @@ export async function showUsage(host: SlashCommandHost): Promise<void> {
    };
    const panel = new UsagePanelComponent(() => buildUsageReportLines(reportArgs), 'primary');
    host.state.transcriptContainer.addChild(panel);
@@ -156,7 +156,7 @@ index 8122b046678395ef515070cc6ded8cdc20aaca88..08214a989055c074f0f4afc60f4ef884
      );
    }
    host.state.ui.requestRender();
-@@ -277,14 +277,20 @@ async function loadManagedUsageReport(host: SlashCommandHost): Promise<ManagedUs
+@@ -273,14 +273,20 @@ async function loadManagedUsageReport(host: SlashCommandHost): Promise<ManagedUs
  }
  
  /**
@@ -186,10 +186,10 @@ index 8122b046678395ef515070cc6ded8cdc20aaca88..08214a989055c074f0f4afc60f4ef884
 +  );
  }
 diff --git a/apps/kimi-code/src/tui/components/messages/usage-panel.ts b/apps/kimi-code/src/tui/components/messages/usage-panel.ts
-index 46d49b8e588b8f9bb1f52aa29661f75c61ca467d..2a0b36bd73cabaea1ba2dbdadcbdb836b4ca14b7 100644
+index 1b0ef7beab741a16f36e5e8ca627bedf109676c7..18c03e09d517ad1000bd80ea786713f11f2a3d06 100644
 --- a/apps/kimi-code/src/tui/components/messages/usage-panel.ts
 +++ b/apps/kimi-code/src/tui/components/messages/usage-panel.ts
-@@ -67,6 +67,8 @@ export interface ManagedUsageReportLineOptions {
+@@ -61,6 +61,8 @@ export interface ManagedUsageReportLineOptions {
  }
  
  export interface MuseUsageReportLineOptions {
@@ -198,7 +198,7 @@ index 46d49b8e588b8f9bb1f52aa29661f75c61ca467d..2a0b36bd73cabaea1ba2dbdadcbdb836
    readonly museUsage?: MuseUsage;
    readonly museUsageError?: string;
  }
-@@ -263,8 +265,9 @@ export function buildManagedUsageReportLines(options: ManagedUsageReportLineOpti
+@@ -251,8 +253,9 @@ export function buildManagedUsageReportLines(options: ManagedUsageReportLineOpti
  }
  
  /**
@@ -210,7 +210,7 @@ index 46d49b8e588b8f9bb1f52aa29661f75c61ca467d..2a0b36bd73cabaea1ba2dbdadcbdb836
   */
  export function buildMuseUsageReportLines(options: MuseUsageReportLineOptions): string[] {
    const accent = (text: string) => currentTheme.boldFg('primary', text);
-@@ -273,7 +276,9 @@ export function buildMuseUsageReportLines(options: MuseUsageReportLineOptions):
+@@ -261,7 +264,9 @@ export function buildMuseUsageReportLines(options: MuseUsageReportLineOptions):
    const errorStyle = (text: string) => currentTheme.fg('error', text);
  
    const usage = options.museUsage;
@@ -628,10 +628,10 @@ index d09c1cb7babfee04af34bb671f2070e1be9954b5..7e7b7cd33155e9810918e79e736a2eeb
 +  });
  });
 diff --git a/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts b/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
-index 8122f8a8790aa5b8faa4f96a9770ad5031e7b61f..f34633dabfb5aaaf67d29e4d8efae3a80e1575f7 100644
+index 14190612c10cf10f0b81228fffeedf23a3c34383..07e1c43c259f1a622b76f2c6019787986067347d 100644
 --- a/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
 +++ b/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
-@@ -318,6 +318,7 @@ describe('UsagePanelComponent', () => {
+@@ -310,6 +310,7 @@ describe('UsagePanelComponent', () => {
  
  describe('Muse usage panel', () => {
    const museUsage = {
@@ -639,7 +639,7 @@ index 8122f8a8790aa5b8faa4f96a9770ad5031e7b61f..f34633dabfb5aaaf67d29e4d8efae3a8
      weekly: { usedRatio: 0.01, resetAt: '2026-11-02T00:00:00.000Z' },
      window: { usedRatio: 0.03, resetAt: '2026-10-27T18:03:59.000Z' },
      windowLabel: '5h window',
-@@ -368,7 +369,7 @@ describe('Muse usage panel', () => {
+@@ -360,7 +361,7 @@ describe('Muse usage panel', () => {
      expect(buildMuseUsageReportLines({})).toEqual([]);
    });
  
@@ -648,7 +648,7 @@ index 8122f8a8790aa5b8faa4f96a9770ad5031e7b61f..f34633dabfb5aaaf67d29e4d8efae3a8
      vi.stubGlobal('fetch', vi.fn(fetchImpl));
      const { showUsage } = await import('#/tui/commands/info');
      const panels: string[][] = [];
-@@ -437,4 +438,130 @@ describe('Muse usage panel', () => {
+@@ -429,4 +430,130 @@ describe('Muse usage panel', () => {
      expect(await runShowUsage({ other: { ...museProvider, apiKeyEnv: 'OTHER_KEY' } }, async () => new Response('{}'))).toHaveLength(1);
      expect(vi.mocked(fetch)).not.toHaveBeenCalled();
    });

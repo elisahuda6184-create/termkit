@@ -1,0 +1,437 @@
+From 32cbe5eec813f1c250f0da0fa63c071be53b0a8c Mon Sep 17 00:00:00 2001
+From: Administrator <administrator@Mac.lan>
+Date: Fri, 23 Oct 2026 08:33:56 +0200
+Subject: [PATCH 10/15] customkimi: send per-model extra_body fields with
+ OpenAI requests
+
+---
+ .../agent-core-v2/docs/config-manifest.toml   |  1 +
+ .../src/app/kosongConfig/configSection.ts     |  2 +
+ .../src/llm-adapter/model/catalog-service.ts  |  2 +
+ .../src/llm-adapter/model/model.ts            |  1 +
+ .../src/llm-adapter/protocol/protocol.ts      |  1 +
+ .../protocol/protocolAdapterRegistry.ts       | 13 +++++++
+ .../test/app/model/model.test.ts              | 10 +++++
+ .../test/llm-adapter/model/catalog.test.ts    | 23 ++++++++++++
+ .../protocol/openai-responses/index.ts        |  1 +
+ .../protocol/openai-responses/lower.ts        | 21 ++++++-----
+ .../src/llm/builtin/protocol/openai/index.ts  |  1 +
+ .../src/llm/builtin/protocol/openai/lower.ts  | 21 ++++++-----
+ packages/core/src/llm/protocol/kit/params.ts  | 12 ++++++
+ .../fixtures/encode/extra-body.ts             | 37 +++++++++++++++++++
+ .../openai-responses/fixtures/encode/index.ts |  2 +
+ .../llm/openai/fixtures/encode/extra-body.ts  | 29 +++++++++++++++
+ .../test/llm/openai/fixtures/encode/index.ts  |  2 +
+ 17 files changed, 161 insertions(+), 18 deletions(-)
+ create mode 100644 packages/core/test/llm/openai-responses/fixtures/encode/extra-body.ts
+ create mode 100644 packages/core/test/llm/openai/fixtures/encode/extra-body.ts
+
+diff --git a/packages/agent-core-v2/docs/config-manifest.toml b/packages/agent-core-v2/docs/config-manifest.toml
+index c3dc25158f9bcaa151618717b41d784c7c339c97..2ccf9642c786bac3798d0410764a0143fb71eaaf 100644
+--- a/packages/agent-core-v2/docs/config-manifest.toml
++++ b/packages/agent-core-v2/docs/config-manifest.toml
+@@ -326,6 +326,7 @@ merge_all_available_skills = true
+     # model: string
+     # migration_markdown: string
+     # retirement_at: string
++  # extra_body: record<string, any>
+   # overrides: object
+     # max_context_size: integer
+     # max_input_size: integer
+diff --git a/packages/agent-core-v2/src/app/kosongConfig/configSection.ts b/packages/agent-core-v2/src/app/kosongConfig/configSection.ts
+index f9219f951fe07a1d9e71b303ceb3c4e6874579f8..6d9d7e8647a652caa3e109b5b8e362f315a17f54 100644
+--- a/packages/agent-core-v2/src/app/kosongConfig/configSection.ts
++++ b/packages/agent-core-v2/src/app/kosongConfig/configSection.ts
+@@ -187,6 +187,7 @@ const ModelBaseSchema = z.object({
+   defaultEffort: z.string().optional(),
+   offEffort: z.string().optional(),
+   upgrade: modelUpgradeSchema.optional(),
++  extraBody: z.record(z.string(), z.unknown()).optional(),
+ });
+ 
+ export const ModelOverrideSchema = ModelBaseSchema.omit({
+@@ -201,6 +202,7 @@ export const ModelOverrideSchema = ModelBaseSchema.omit({
+   model: true,
+   betaApi: true,
+   upgrade: true,
++  extraBody: true,
+ }).partial();
+ 
+ export const ModelRecordSchema = ModelBaseSchema.extend({
+diff --git a/packages/agent-core-v2/src/llm-adapter/model/catalog-service.ts b/packages/agent-core-v2/src/llm-adapter/model/catalog-service.ts
+index 19ee3a6ab3216b850d92b4931e802bf879e8aee7..6a6a45bec4362075cd72e070397c305eab811f55 100644
+--- a/packages/agent-core-v2/src/llm-adapter/model/catalog-service.ts
++++ b/packages/agent-core-v2/src/llm-adapter/model/catalog-service.ts
+@@ -490,6 +490,7 @@ function buildProtocolProviderOptions(
+       const reasoningKey = nonEmpty(model.reasoningKey);
+       if (reasoningKey !== undefined) options.reasoningKey = reasoningKey;
+       if (model.offEffort !== undefined) options.offEffort = model.offEffort;
++      if (model.extraBody !== undefined) options.extraBody = model.extraBody;
+       break;
+     }
+     case 'google-genai': {
+@@ -504,6 +505,7 @@ function buildProtocolProviderOptions(
+     }
+     case 'openai_responses':
+       if (model.offEffort !== undefined) options.offEffort = model.offEffort;
++      if (model.extraBody !== undefined) options.extraBody = model.extraBody;
+       break;
+     default: {
+       const exhaustive: never = protocol;
+diff --git a/packages/agent-core-v2/src/llm-adapter/model/model.ts b/packages/agent-core-v2/src/llm-adapter/model/model.ts
+index bd9c6303e05fac45dc914e0cbf3612f17d98fd6f..59ffd7f7ec3f1268cfeb1ade3132cb5dcd398063 100644
+--- a/packages/agent-core-v2/src/llm-adapter/model/model.ts
++++ b/packages/agent-core-v2/src/llm-adapter/model/model.ts
+@@ -52,6 +52,7 @@ export interface ModelRecord {
+   defaultEffort?: string;
+   offEffort?: string;
+   upgrade?: ModelUpgrade;
++  extraBody?: Record<string, unknown>;
+ 
+   overrides?: ModelOverride;
+ 
+diff --git a/packages/agent-core-v2/src/llm-adapter/protocol/protocol.ts b/packages/agent-core-v2/src/llm-adapter/protocol/protocol.ts
+index f38e1c65d2388774aeedceee39ee9a65385890c3..3814f6674c78b2f2bc2d91a650481b7b665ba6bd 100644
+--- a/packages/agent-core-v2/src/llm-adapter/protocol/protocol.ts
++++ b/packages/agent-core-v2/src/llm-adapter/protocol/protocol.ts
+@@ -25,6 +25,7 @@ export interface ProtocolProviderOptions {
+   readonly vertexai?: boolean;
+   readonly project?: string;
+   readonly location?: string;
++  readonly extraBody?: Readonly<Record<string, unknown>>;
+ }
+ 
+ export interface ProtocolAdapterConfig {
+diff --git a/packages/agent-core-v2/src/llm-adapter/protocol/protocolAdapterRegistry.ts b/packages/agent-core-v2/src/llm-adapter/protocol/protocolAdapterRegistry.ts
+index 2d34a055ee8a3f5747ab248b48e7e273fbd9b253..2b4df96840224d8b164ff0210addfa21a58b83cd 100644
+--- a/packages/agent-core-v2/src/llm-adapter/protocol/protocolAdapterRegistry.ts
++++ b/packages/agent-core-v2/src/llm-adapter/protocol/protocolAdapterRegistry.ts
+@@ -52,12 +52,14 @@ function routeFor(model: Model): AdapterRoute {
+           reasoningKey:
+             definition?.requester === undefined ? openAIReasoningKeyFor(model) : undefined,
+           toolMessageConversion: definition?.requester === undefined ? undefined : 'keep_parts',
++          extraBody: model.providerOptions?.extraBody,
+         },
+         providerId: 'openai',
+       };
+     case 'openai_responses':
+       return {
+         requester: definition?.requester ?? openAIResponsesRequester,
++        options: { extraBody: model.providerOptions?.extraBody },
+         providerId: 'openai-responses',
+       };
+     case 'anthropic':
+@@ -84,6 +86,16 @@ function routeFor(model: Model): AdapterRoute {
+   }
+ }
+ 
++function stableJson(value: unknown): unknown {
++  if (Array.isArray(value)) return value.map(stableJson);
++  if (typeof value !== 'object' || value === null) return value;
++  return Object.fromEntries(
++    Object.entries(value)
++      .toSorted(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
++      .map(([key, entry]) => [key, stableJson(entry)]),
++  );
++}
++
+ export class ProtocolAdapterRegistry implements IProtocolAdapterRegistry {
+   declare readonly _serviceBrand: undefined;
+ 
+@@ -168,6 +180,7 @@ export class ProtocolAdapterRegistry implements IProtocolAdapterRegistry {
+           route.providerId,
+           model.providerOptions?.betaApi === true,
+           model.providerOptions?.vertexai === true,
++          stableJson(model.providerOptions?.extraBody),
+         ]),
+       },
+       endpoint,
+diff --git a/packages/agent-core-v2/test/app/model/model.test.ts b/packages/agent-core-v2/test/app/model/model.test.ts
+index f76c8a84128d61df5c8396424ac0f2b916d68613..08fcb30a924febfd5543c4cb214367020fa237e1 100644
+--- a/packages/agent-core-v2/test/app/model/model.test.ts
++++ b/packages/agent-core-v2/test/app/model/model.test.ts
+@@ -214,6 +214,16 @@ describe('models TOML transforms', () => {
+     });
+   });
+ 
++  it('keeps extra_body keys verbatim in both directions', () => {
++    const extraBody = { provider: { only: ['cerebras/fp16'], allow_fallbacks: false } };
++    expect(
++      modelsFromToml({ qwen: { provider: 'p', model: 'm', extra_body: extraBody } }),
++    ).toEqual({ qwen: { provider: 'p', model: 'm', extraBody } });
++    expect(
++      modelsToToml({ qwen: { provider: 'p', model: 'm', extraBody } }, {}),
++    ).toEqual({ qwen: { provider: 'p', model: 'm', extra_body: extraBody } });
++  });
++
+   it('snakeCases nested model overrides for TOML', () => {
+     expect(
+       modelsToToml(
+diff --git a/packages/agent-core-v2/test/llm-adapter/model/catalog.test.ts b/packages/agent-core-v2/test/llm-adapter/model/catalog.test.ts
+index 641b6a430cb4041ba1bc6d14b1615fd7d5906efa..b79048492165f3db5abeff211224a64eb7f1f339 100644
+--- a/packages/agent-core-v2/test/llm-adapter/model/catalog.test.ts
++++ b/packages/agent-core-v2/test/llm-adapter/model/catalog.test.ts
+@@ -357,6 +357,29 @@ describe('Model assembly (pure data)', () => {
+     }
+   });
+ 
++  it('passes a declared extraBody through providerOptions for the OpenAI wires only', () => {
++    const extraBody = { provider: { only: ['cerebras/fp16'], allow_fallbacks: false } };
++    const { host, catalog } = createHost({
++      providers: {
++        gateway: { type: 'openai', apiKey: 'sk-gw', baseUrl: 'https://gateway.example.test/v1' },
++        responses: { type: 'openai_responses', apiKey: 'sk-r' },
++        claude: { type: 'anthropic', apiKey: 'sk-a' },
++      },
++      models: {
++        chat: { provider: 'gateway', model: 'qwen', maxContextSize: 65536, extraBody },
++        resp: { provider: 'responses', model: 'qwen', maxContextSize: 65536, extraBody },
++        anth: { provider: 'claude', model: 'claude-x', maxContextSize: 1000, extraBody },
++      },
++    });
++    try {
++      expect(catalog.get('chat').providerOptions).toEqual({ extraBody });
++      expect(catalog.get('resp').providerOptions).toEqual({ extraBody });
++      expect(catalog.get('anth').providerOptions?.extraBody).toBeUndefined();
++    } finally {
++      host.dispose();
++    }
++  });
++
+   it('enables google-genai vertex mode through providerOptions when project and location resolve', () => {
+     const { host, catalog } = createHost({
+       providers: {
+diff --git a/packages/core/src/llm/builtin/protocol/openai-responses/index.ts b/packages/core/src/llm/builtin/protocol/openai-responses/index.ts
+index 85312fc4bacf99ad3a335e6171542c0f6dabd097..9956720653fa5225d6cfd28dcefb6c50a7ba8a5b 100644
+--- a/packages/core/src/llm/builtin/protocol/openai-responses/index.ts
++++ b/packages/core/src/llm/builtin/protocol/openai-responses/index.ts
+@@ -31,6 +31,7 @@ export {
+ } from './lower';
+ 
+ export interface OpenAIResponsesOptions {
++  readonly extraBody?: Readonly<Record<string, unknown>>;
+   readonly extras?: OpenAIResponsesExtraParams;
+   readonly toolMessageConversion?: ToolMessageConversion;
+ }
+diff --git a/packages/core/src/llm/builtin/protocol/openai-responses/lower.ts b/packages/core/src/llm/builtin/protocol/openai-responses/lower.ts
+index cdc9357fae3b27e3edb152b310433b030c099272..131429e34048de9711dd50fa15b75abeec0a3086 100644
+--- a/packages/core/src/llm/builtin/protocol/openai-responses/lower.ts
++++ b/packages/core/src/llm/builtin/protocol/openai-responses/lower.ts
+@@ -4,7 +4,7 @@ import { shake } from 'radashi';
+ import type { ContentPart, Message, ToolDescription } from '#/llm/message';
+ import type { LlmSampling, ResponseFormat, ThinkingRequestOptions } from '#/llm/request';
+ import { mediaUrlOf } from '#/llm/protocol/kit/media';
+-import { withExtras } from '#/llm/protocol/kit/params';
++import { withExtraBody, withExtras } from '#/llm/protocol/kit/params';
+ import type { NativeModule, PipelineSpec } from '#/llm/protocol/pipeline';
+ import type { LlmModule } from '#/llm/protocol/protocol';
+ import type { MediaSupport } from '#/llm/protocol/rules/media';
+@@ -271,14 +271,17 @@ function flatten(
+   module: OpenAIResponsesModule,
+ ): Request {
+   const params = withExtras(
+-    {
+-      model: module.model.spec.name,
+-      instructions: native.system ? native.system : undefined,
+-      input: native.messages,
+-      tools: native.tools.length === 0 ? undefined : native.tools,
+-      store: false,
+-      ...native.params,
+-    },
++    withExtraBody(
++      {
++        model: module.model.spec.name,
++        instructions: native.system ? native.system : undefined,
++        input: native.messages,
++        tools: native.tools.length === 0 ? undefined : native.tools,
++        store: false,
++        ...native.params,
++      },
++      module.options?.extraBody,
++    ),
+     module.options?.extras,
+   );
+   return { params: params as unknown as Request['params'] };
+diff --git a/packages/core/src/llm/builtin/protocol/openai/index.ts b/packages/core/src/llm/builtin/protocol/openai/index.ts
+index 9eceeb7ffcb59b7870a87c395f8d306dd85c4f32..dc4013ffe75aa1b231529f55e9c8df75a2399ad8 100644
+--- a/packages/core/src/llm/builtin/protocol/openai/index.ts
++++ b/packages/core/src/llm/builtin/protocol/openai/index.ts
+@@ -35,6 +35,7 @@ export {
+ export { openAIModelLegality, resolveOpenAIReasoningKey } from './legalize';
+ 
+ export interface OpenAIOptions {
++  readonly extraBody?: Readonly<Record<string, unknown>>;
+   readonly extras?: OpenAIExtraParams;
+   readonly reasoningKey?: string;
+   readonly detectedReasoningKey?: string | (() => string | undefined);
+diff --git a/packages/core/src/llm/builtin/protocol/openai/lower.ts b/packages/core/src/llm/builtin/protocol/openai/lower.ts
+index ac5e261226ffec0ecf9712d47970c62657e505c8..94f6cee937b137d53416a4de506c9f7a91764a44 100644
+--- a/packages/core/src/llm/builtin/protocol/openai/lower.ts
++++ b/packages/core/src/llm/builtin/protocol/openai/lower.ts
+@@ -5,7 +5,7 @@ import { extractText, type ContentPart, type Message, type ToolDescription } fro
+ import type { LlmModelSpec, LlmSampling, ResponseFormat, ThinkingRequestOptions } from '#/llm/request';
+ import { resolveThinkingEffort } from '#/llm/thinking';
+ import { mediaFileIdOf, mediaUrlOf } from '#/llm/protocol/kit/media';
+-import { withExtras } from '#/llm/protocol/kit/params';
++import { withExtraBody, withExtras } from '#/llm/protocol/kit/params';
+ import type { NativeModule, PipelineSpec } from '#/llm/protocol/pipeline';
+ import type { LlmModule, ToolMessageConversion } from '#/llm/protocol/protocol';
+ import type { MediaSupport } from '#/llm/protocol/rules/media';
+@@ -297,14 +297,17 @@ function flatten(
+   module: OpenAIModule,
+ ): Request {
+   const params = withExtras(
+-    {
+-      model: module.model.spec.name,
+-      messages: native.system
+-        ? [{ role: 'system', content: native.system }, ...native.messages]
+-        : native.messages,
+-      tools: native.tools.length === 0 ? undefined : native.tools,
+-      ...native.params,
+-    },
++    withExtraBody(
++      {
++        model: module.model.spec.name,
++        messages: native.system
++          ? [{ role: 'system', content: native.system }, ...native.messages]
++          : native.messages,
++        tools: native.tools.length === 0 ? undefined : native.tools,
++        ...native.params,
++      },
++      module.options?.extraBody,
++    ),
+     module.options?.extras,
+   );
+   return { params: params as unknown as Request['params'] };
+diff --git a/packages/core/src/llm/protocol/kit/params.ts b/packages/core/src/llm/protocol/kit/params.ts
+index 8c2aa96290099fde7813edf271f5fff0dee3ad0d..32cae49acfa8b8b60d66cd407d3c53ba2987268e 100644
+--- a/packages/core/src/llm/protocol/kit/params.ts
++++ b/packages/core/src/llm/protocol/kit/params.ts
+@@ -8,3 +8,15 @@ export function withExtras<TParams extends object>(
+     assign(params as Record<string, unknown>, (extras ?? {}) as Record<string, unknown>),
+   ) as TParams;
+ }
++
++export function withExtraBody<TParams extends object>(
++  params: TParams,
++  extraBody: Readonly<Record<string, unknown>> | undefined,
++): TParams {
++  if (extraBody === undefined) return params;
++  const merged: Record<string, unknown> = { ...extraBody };
++  for (const [key, value] of Object.entries(params)) {
++    if (value !== undefined) merged[key] = value;
++  }
++  return shake(merged) as TParams;
++}
+diff --git a/packages/core/test/llm/openai-responses/fixtures/encode/extra-body.ts b/packages/core/test/llm/openai-responses/fixtures/encode/extra-body.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..98fd5b4610693fc8c5c1e1b6f727709cd66ca498
+--- /dev/null
++++ b/packages/core/test/llm/openai-responses/fixtures/encode/extra-body.ts
+@@ -0,0 +1,37 @@
++import { TEST_MODEL, testModule } from '../../../harness';
++import type { OpenAIResponsesEncodeFixture } from '../types';
++
++export default {
++  name: 'extra-body',
++  module: testModule({
++    model: {
++      ...TEST_MODEL,
++      spec: { ...TEST_MODEL.spec, provider: 'openai', name: 'gpt-5-codex' },
++      thinking: { effort: 'high' },
++    },
++    messages: [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }],
++    options: {
++      extraBody: {
++        model: 'extra-body model',
++        store: true,
++        provider: { only: ['cerebras/fp16'], allow_fallbacks: false },
++      },
++    },
++  }),
++  expected: {
++    params: {
++      model: 'gpt-5-codex',
++      input: [
++        {
++          type: 'message',
++          role: 'user',
++          content: [{ type: 'input_text', text: 'Hello' }],
++        },
++      ],
++      store: false,
++      reasoning: { effort: 'high', summary: 'auto' },
++      include: ['reasoning.encrypted_content'],
++      provider: { only: ['cerebras/fp16'], allow_fallbacks: false },
++    },
++  },
++} satisfies OpenAIResponsesEncodeFixture;
+diff --git a/packages/core/test/llm/openai-responses/fixtures/encode/index.ts b/packages/core/test/llm/openai-responses/fixtures/encode/index.ts
+index 1ab4881c7c5eba6c9ed35aa7e72fe7598c587799..75c68f69dd7374b166a38f9cb768675cae5db2f7 100644
+--- a/packages/core/test/llm/openai-responses/fixtures/encode/index.ts
++++ b/packages/core/test/llm/openai-responses/fixtures/encode/index.ts
+@@ -1,8 +1,10 @@
++import extraBody from './extra-body';
+ import inputItemsAndParams from './input-items-and-params';
+ import reasoningAndFunctionHistory from './reasoning-and-function-history';
+ import unsupportedAudio from './unsupported-audio';
+ 
+ export const openAIResponsesEncodeFixtures = [
++  extraBody,
+   inputItemsAndParams,
+   reasoningAndFunctionHistory,
+   unsupportedAudio,
+diff --git a/packages/core/test/llm/openai/fixtures/encode/extra-body.ts b/packages/core/test/llm/openai/fixtures/encode/extra-body.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..768d808db28a5edb8d6741885142f4b809f7a579
+--- /dev/null
++++ b/packages/core/test/llm/openai/fixtures/encode/extra-body.ts
+@@ -0,0 +1,29 @@
++import { TEST_MODEL, testModule } from '../../../harness';
++import type { OpenAIEncodeFixture } from '../types';
++
++export default {
++  name: 'extra-body',
++  module: testModule({
++    model: {
++      ...TEST_MODEL,
++      spec: { ...TEST_MODEL.spec, provider: 'openai', name: 'gpt-5.1' },
++      thinking: { effort: 'high' },
++    },
++    messages: [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }],
++    options: {
++      extraBody: {
++        model: 'extra-body model',
++        reasoning_effort: 'low',
++        provider: { only: ['cerebras/fp16'], allow_fallbacks: false },
++      },
++    },
++  }),
++  expected: {
++    params: {
++      model: 'gpt-5.1',
++      messages: [{ role: 'user', content: 'Hello' }],
++      reasoning_effort: 'high',
++      provider: { only: ['cerebras/fp16'], allow_fallbacks: false },
++    },
++  },
++} satisfies OpenAIEncodeFixture;
+diff --git a/packages/core/test/llm/openai/fixtures/encode/index.ts b/packages/core/test/llm/openai/fixtures/encode/index.ts
+index 94b56623cbe47c94da5fef313427c0f9bd13d4d7..0d7d24a8694dab53c5997b3fab9d44b4b4b0b5a9 100644
+--- a/packages/core/test/llm/openai/fixtures/encode/index.ts
++++ b/packages/core/test/llm/openai/fixtures/encode/index.ts
+@@ -1,9 +1,11 @@
+ import basicTextAndParams from './basic-text-and-params';
++import extraBody from './extra-body';
+ import multimodalToolHistory from './multimodal-tool-history';
+ import reasoningDetails from './reasoning-details';
+ 
+ export const openAIEncodeFixtures = [
+   basicTextAndParams,
++  extraBody,
+   multimodalToolHistory,
+   reasoningDetails,
+ ];
+-- 
+2.50.1 (Apple Git-155)
+

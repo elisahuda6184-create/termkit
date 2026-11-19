@@ -1,7 +1,7 @@
-From f342455148dc3096ce6154b45f1e45e89c0bb8a1 Mon Sep 17 00:00:00 2001
+From 95e09c05a008cd4269c02e35de623d3ad7d82fc1 Mon Sep 17 00:00:00 2001
 From: CustomKIMI <customkimi@localhost>
 Date: Wed, 18 Nov 2026 23:12:00 +0700
-Subject: [PATCH 16/16] customkimi: retry automatically when Gemini's filter
+Subject: [PATCH 15/15] customkimi: retry automatically when Gemini's filter
  blocks a reply
 
 When a reply is Gemini's block notice ("This request was blocked by
@@ -30,21 +30,23 @@ failing the turn, and turn.filtered follows the last step.
  .../components/dialogs/settings-selector.ts   |   7 +
  .../gemini-filter-retry-preferences.test.ts   |  63 ++++
  .../agent-core-v2/docs/config-manifest.toml   |  11 +-
- packages/agent-core-v2/src/agent/loop/loop.ts |  28 +-
- .../src/agent/loop/loopService.ts             |  43 ++-
+ .../agent-core-v2/src/agent/loop/journal.ts   |   2 +-
+ packages/agent-core-v2/src/agent/loop/loop.ts |  26 ++
+ .../src/agent/loop/loopService.ts             | 104 +++++-
+ .../src/agent/loop/turnProjection.ts          |   2 +-
  .../geminiFilterRetry/geminiFilterRetry.ts    | 102 ++++++
  .../geminiFilterRetryFeature.ts               |  17 +
- .../geminiFilterRetryService.ts               | 162 ++++++++++
+ .../geminiFilterRetryService.ts               | 161 ++++++++++
  packages/agent-core-v2/src/index.ts           |   3 +
  .../agent-core-v2/test/agent/loop/stubs.ts    |   1 +
  .../toolSelect/toolSelectService.test.ts      |   4 +
- .../geminiFilterRetry.test.ts                 | 300 ++++++++++++++++++
+ .../geminiFilterRetry.test.ts                 | 301 ++++++++++++++++++
  .../subagent/subagentScopeCache.test.ts       |   1 +
  .../kap-server/src/protocol/rest-config.ts    |   2 +
  packages/node-sdk/src/config/schema.ts        |   2 +
  packages/node-sdk/src/config/toml.ts          |   1 +
  packages/node-sdk/src/v2/config-mapper.ts     |   1 +
- 19 files changed, 862 insertions(+), 4 deletions(-)
+ 21 files changed, 924 insertions(+), 5 deletions(-)
  create mode 100644 apps/kimi-code/src/tui/components/dialogs/gemini-filter-retry-selector.ts
  create mode 100644 apps/kimi-code/test/tui/commands/gemini-filter-retry-preferences.test.ts
  create mode 100644 packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetry.ts
@@ -53,10 +55,10 @@ failing the turn, and turn.filtered follows the last step.
  create mode 100644 packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry.test.ts
 
 diff --git a/apps/kimi-code/src/tui/commands/config.ts b/apps/kimi-code/src/tui/commands/config.ts
-index 5ba92a45a0ccfa9db3d7a271e48010f266ec74a3..def79a9fa6beea721d17b55cb113fd1658aee1b8 100644
+index e3182a306478057c82b0c6925fdeba6ae464a467..e1a70406bcc2923d2213e6d6643fae1fd37820a2 100644
 --- a/apps/kimi-code/src/tui/commands/config.ts
 +++ b/apps/kimi-code/src/tui/commands/config.ts
-@@ -11,6 +11,10 @@ import {
+@@ -11,6 +11,10 @@ import { isKittyProtocolActive, TuiAltScreen } from '@moonshot-ai/pi-tui';
  
  import { EditorSelectorComponent } from '../components/dialogs/editor-selector';
  import { EffortSelectorComponent } from '../components/dialogs/effort-selector';
@@ -67,7 +69,7 @@ index 5ba92a45a0ccfa9db3d7a271e48010f266ec74a3..def79a9fa6beea721d17b55cb113fd16
  import {
    ExperimentsSelectorComponent,
    type ExperimentalFeatureDraftChange,
-@@ -917,6 +921,67 @@ export async function applySurveyPreferenceChoice(
+@@ -1000,6 +1004,67 @@ export async function applySurveyPreferenceChoice(
    host.showStatus(`Feedback survey ${enabled ? 'enabled' : 'disabled'}.`);
  }
  
@@ -135,7 +137,7 @@ index 5ba92a45a0ccfa9db3d7a271e48010f266ec74a3..def79a9fa6beea721d17b55cb113fd16
  export function showMermaidPreferencePicker(host: SlashCommandHost): void {
    host.mountEditorReplacement(
      new MermaidPreferenceSelectorComponent({
-@@ -1049,6 +1114,7 @@ function handleSettingsSelection(host: SlashCommandHost, value: SettingsSelectio
+@@ -1302,6 +1367,7 @@ function handleSettingsSelection(host: SlashCommandHost, value: SettingsSelectio
      case 'survey': showSurveyPreferencePicker(host); return;
      case 'experiments': void showExperimentsPanel(host); return;
      case 'upgrade': showUpdatePreferencePicker(host); return;
@@ -202,10 +204,10 @@ index 0000000000000000000000000000000000000000..20a39cf3eebc536ee9f48a31d0cb4a69
 +  }
 +}
 diff --git a/apps/kimi-code/src/tui/components/dialogs/settings-selector.ts b/apps/kimi-code/src/tui/components/dialogs/settings-selector.ts
-index ec0e3c950fef66c1b6fa39ad6b532cc5f2bc4ca5..effe483c046b41ed821005b9d6d2f92c5e9ea2ce 100644
+index e6db45217dd27286113ae964cf66a66e5b1cdad8..4559bb4f8afd2c424f40b2cf5ce83ad31d704768 100644
 --- a/apps/kimi-code/src/tui/components/dialogs/settings-selector.ts
 +++ b/apps/kimi-code/src/tui/components/dialogs/settings-selector.ts
-@@ -10,6 +10,7 @@ export type SettingsSelection =
+@@ -17,6 +17,7 @@ export type SettingsSelection =
    | 'survey'
    | 'experiments'
    | 'upgrade'
@@ -213,7 +215,7 @@ index ec0e3c950fef66c1b6fa39ad6b532cc5f2bc4ca5..effe483c046b41ed821005b9d6d2f92c
    | 'usage';
  
  const SETTINGS_OPTIONS: readonly ChoiceOption[] = [
-@@ -58,6 +59,11 @@ const SETTINGS_OPTIONS: readonly ChoiceOption[] = [
+@@ -85,6 +86,11 @@ const SETTINGS_OPTIONS: readonly ChoiceOption[] = [
      label: 'Automatic updates',
      description: 'Turn automatic CLI updates on or off.',
    },
@@ -225,7 +227,7 @@ index ec0e3c950fef66c1b6fa39ad6b532cc5f2bc4ca5..effe483c046b41ed821005b9d6d2f92c
    {
      value: 'usage',
      label: 'Usage',
-@@ -76,6 +82,7 @@ function isSettingsSelection(value: string): value is SettingsSelection {
+@@ -107,6 +113,7 @@ function isSettingsSelection(value: string): value is SettingsSelection {
      value === 'survey' ||
      value === 'experiments' ||
      value === 'upgrade' ||
@@ -303,27 +305,27 @@ index 0000000000000000000000000000000000000000..331c269acb0e650d0223e128f8758829
 +  });
 +});
 diff --git a/packages/agent-core-v2/docs/config-manifest.toml b/packages/agent-core-v2/docs/config-manifest.toml
-index 7ae6f7d121d0bcd0b50ae93c3f33c44ea3bb47f3..ea522ca848187729f087ad8a88c9bb05641ed199 100644
+index 2ccf9642c786bac3798d0410764a0143fb71eaaf..760fecc7797d88de12d7075bff65ed59c0e4df97 100644
 --- a/packages/agent-core-v2/docs/config-manifest.toml
 +++ b/packages/agent-core-v2/docs/config-manifest.toml
 @@ -8,7 +8,7 @@
  # commented "# field: type" lines describe the remaining schema fields.
  # Values resolve as: default -> config.toml -> env overlay -> memory.
  
--# Index (29 sections · 2 overlay(s))
-+# Index (30 sections · 2 overlay(s))
+-# Index (32 sections · 2 overlay(s))
++# Index (33 sections · 2 overlay(s))
  #   background               src/agent/task/configSection.ts
  #   builtinProductSkills     src/features/skill/catalog/configSection.ts
  #   cron                     src/features/cron/configSection.ts
-@@ -18,6 +18,7 @@
+@@ -19,6 +19,7 @@
  #   experimental             src/app/flag/flag.ts
  #   extraAgentDirs           src/workspace/workspaceAgentProfileLoader/configSection.ts
  #   extraSkillDirs           src/features/skill/catalog/configSection.ts
 +#   geminiFilterRetry        src/features/geminiFilterRetry/geminiFilterRetry.ts
  #   hooks                    src/features/externalHooks/configSection.ts
+ #   hosts                    src/app/hostsConfig/configSection.ts
  #   identity                 src/app/agentIdentity/configSection.ts
- #   image                    src/agent/media/configSection.ts
-@@ -159,6 +160,14 @@ extra_agent_dirs = []
+@@ -171,6 +172,14 @@ extra_agent_dirs = []
  
  extra_skill_dirs = []
  
@@ -338,20 +340,24 @@ index 7ae6f7d121d0bcd0b50ae93c3f33c44ea3bb47f3..ea522ca848187729f087ad8a88c9bb05
  # ##########################################################################
  # hooks
  #   owner: src/features/externalHooks/configSection.ts
+diff --git a/packages/agent-core-v2/src/agent/loop/journal.ts b/packages/agent-core-v2/src/agent/loop/journal.ts
+index d17210f9d6ac03adda326138b2ce713031be4407..c77e898aa7a7d3afbb86e35c2b2453c7043c4112 100644
+--- a/packages/agent-core-v2/src/agent/loop/journal.ts
++++ b/packages/agent-core-v2/src/agent/loop/journal.ts
+@@ -637,7 +637,7 @@ export class LoopJournal {
+   private turnId = 0;
+ 
+   private settleContext(messages: readonly Message[], reason: string | undefined): void {
+-    if (reason === 'compaction') return;
++    if (reason === 'compaction' || reason === 'llm-recovery') return;
+     if (reason === 'clear' || reason === 'context.clear') {
+       this.write({ type: 'context.clear', agentId: this.agentId });
+       return;
 diff --git a/packages/agent-core-v2/src/agent/loop/loop.ts b/packages/agent-core-v2/src/agent/loop/loop.ts
-index 7a28b48848cdb84634378c25d850b7e2605d3533..b94b444a9ffdbd42d34e84ea4ddabd14c2208c40 100644
+index 08d37dcc6401bc10c18a513d19d576e105173034..c7ca827102125ed0274deaa18682e9cd416e0226 100644
 --- a/packages/agent-core-v2/src/agent/loop/loop.ts
 +++ b/packages/agent-core-v2/src/agent/loop/loop.ts
-@@ -3,7 +3,7 @@ import type { IDisposable } from '#/_base/di/lifecycle';
- import { Error2, isError2, type Error2Options } from '#/_base/errors/errors';
- import type { ContextMessage } from '#/agent/contextMemory/types';
- import type { FinishReason } from '#human/llm/finish-reason';
--import type { ContentPart, TextPart } from '#human/llm/message';
-+import type { ContentPart, Message, TextPart } from '#human/llm/message';
- import type { TokenUsage } from '#human/llm/usage';
- import type { Hooks } from '#/hooks';
- import type { UserEntry } from '#human/agent/turn';
-@@ -93,6 +93,30 @@ export interface LoopErrorHandler {
+@@ -128,6 +128,30 @@ export interface LoopErrorHandler {
    handle(context: LoopErrorContext): Promise<boolean | undefined>;
  }
  
@@ -382,7 +388,7 @@ index 7a28b48848cdb84634378c25d850b7e2605d3533..b94b444a9ffdbd42d34e84ea4ddabd14
  export interface LoopErrorHandlerRegistrationOptions {
    readonly before?: string;
    readonly after?: string;
-@@ -232,6 +256,8 @@ export interface IAgentLoopService {
+@@ -327,6 +351,8 @@ export interface IAgentLoopService extends EffectiveProfileReader {
      options?: LoopErrorHandlerRegistrationOptions,
    ): IDisposable;
  
@@ -390,41 +396,84 @@ index 7a28b48848cdb84634378c25d850b7e2605d3533..b94b444a9ffdbd42d34e84ea4ddabd14
 +
    readonly hooks: Hooks<{
      onWillBeginStep: BeforeStepContext;
-     onDidFinishStep: AfterStepContext;
+     /** After onDidFinishStep, Core consumes queued reminders before assembling the next LLM request. */
 diff --git a/packages/agent-core-v2/src/agent/loop/loopService.ts b/packages/agent-core-v2/src/agent/loop/loopService.ts
-index 700fc29ee89dd81ebeb822e7cfc3a151ab92599c..6e34ca226b77b9deb4fca01ab743ead4aab4c8b9 100644
+index e88b1cdfb811728ef05431fa8fd0e69bd3029ec9..efbd142b35f9639d36acc6cf8d50f169fc002340 100644
 --- a/packages/agent-core-v2/src/agent/loop/loopService.ts
 +++ b/packages/agent-core-v2/src/agent/loop/loopService.ts
-@@ -71,6 +71,9 @@ import {
-   type LoopErrorContext,
+@@ -36,6 +36,7 @@ import { getProviderDefinition } from '#/llm-adapter/provider/provider-definitio
+ import { ISessionRequestAttributionService } from '#/session/requestAttribution/requestAttribution';
+ import { IBootstrapService } from '#/app/bootstrap/bootstrap';
+ import { credentialRecovery } from '@moonshot-ai/core/llm/policy/credentials';
++import type { LlmRecovery } from '@moonshot-ai/core/llm/policy/recovery';
+ import { IAgentToolExecutorService } from '#/agent/toolExecutor/toolExecutor';
+ import { agentTaskInfo } from '#/agent/task/handler';
+ import { IAgentTaskHistoryService } from '#/agent/task/taskService';
+@@ -56,7 +57,7 @@ import {
+ } from '@moonshot-ai/core/llm/message';
+ import { BugIndicatingError, ErrorCodes, Error2, isError2 } from '#/errors';
+ import { OrderedHookSlot } from '#/hooks';
+-import { ContextSpliced } from '#/agent/contextMemory/contextEvents';
++import { ContextAppendMessage, ContextSpliced } from '#/agent/contextMemory/contextEvents';
+ import { newMessageId } from '#/agent/contextMemory/messageId';
+ import { type ContextMessage, type PromptOrigin } from '#/agent/contextMemory/types';
+ import { gateImageFormatParts } from '#/agent/media/image-compress';
+@@ -117,6 +118,9 @@ import {
+   type LoopDetachedTask,
    type LoopErrorHandler,
    type LoopErrorHandlerRegistrationOptions,
 +  type LoopLlmRecovery,
 +  type LoopLlmRecoveryContext,
 +  type LoopLlmRecoveryProposal,
    type LoopNotify,
+   type LoopNotifyMessage,
    type LoopNotifyHandle,
-   type LoopRunResult,
-@@ -140,6 +143,8 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+@@ -130,7 +134,7 @@ import {
+   type TurnResult,
+ } from './loop';
+ import { TurnCancel, turnKey } from './turnOps';
+-import { EMPTY_LOOP_PROMPT, historyEntryFromContext } from './history';
++import { EMPTY_LOOP_PROMPT, historyEntryFromContext, historyFromContext } from './history';
+ import {
+   createLoop,
+   createMaxStepsHook,
+@@ -179,6 +183,8 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
    };
  
    private readonly errorHandlers: LoopErrorHandler[] = [];
 +  private readonly llmRecoveries: LoopLlmRecovery[] = [];
-+  private pendingRecoveryMessages: readonly ContextMessage[] = [];
-   private readonly promptWaiters = new Map<string, PromptWaiter>();
-   private readonly steered = new Map<string, SteeredPrompt>();
-   private readonly terminalStates = new Map<string, PromptState>();
-@@ -219,6 +224,9 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
-               step: this.active.gatedSteps,
-             },
-       gate: (signal) => this.gate(signal),
-+      recovery: {
-+        propose: (context) => this.proposeLlmRecovery(context),
++  private pendingRecoveryMessages: ContextMessage[] = [];
+   private readonly pendingSubmissions: UserMessage[] = [];
+   private readonly pendingReminders: Message[] = [];
+   private readonly pendingNotifications: UserMessage[] = [];
+@@ -230,6 +236,18 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+     super();
+     const space = this.scopeContext.agentContext.space;
+     if (space instanceof AgentSpaceImpl) this._register(space._setHistoryProvider(() => this.history()));
++    this._register(this.hooks.onDidFinishStep.register('llm-recovery-messages', async (_step, next) => {
++      this.flushRecoveryMessages(true);
++      await next();
++    }));
++    this.errorHandlers.push({
++      id: 'llm-recovery-messages',
++      match: () => {
++        this.flushRecoveryMessages(false);
++        return false;
 +      },
-       promptGate: (queueItemId, message) => this.runPromptGate(queueItemId, message),
-       onTrace: (trace) => {
-         this.activeRequestTrace = trace;
-@@ -963,6 +971,34 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
++      handle: async () => false,
++    });
+     this.observer = instantiation.createInstance(AgentLoopRequestObserver);
+     this.projector = new AgentLoopProjector((anomalies) => this.observer.reportProjectionRepairs(anomalies));
+     this.requestMetadata = new RequestMetadataTracker(scopeContext, dispatcher, attribution);
+@@ -698,6 +716,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+         infiniteRetry: this.infiniteRetryEnabled,
+       },
+       recoveries: [
++        ...this.coreLlmRecoveries(),
+         credentialRecovery,
+         createStructureRecovery(this.projector),
+         mediaPolicy.recovery,
+@@ -1422,6 +1441,87 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
      });
    }
  
@@ -441,57 +490,90 @@ index 700fc29ee89dd81ebeb822e7cfc3a151ab92599c..6e34ca226b77b9deb4fca01ab743ead4
 +    if (index >= 0) this.llmRecoveries.splice(index, 1);
 +  }
 +
-+  private proposeLlmRecovery(
-+    context: LoopLlmRecoveryContext,
-+  ): Pick<LoopLlmRecoveryProposal, 'strategy' | 'action'> | undefined {
-+    for (const recovery of this.llmRecoveries) {
-+      try {
-+        const proposal = recovery.propose(context);
-+        if (proposal === undefined) continue;
-+        this.pendingRecoveryMessages = proposal.appendMessages ?? [];
-+        return { strategy: proposal.strategy, action: proposal.action };
-+      } catch {
-+      }
++  private coreLlmRecoveries(): readonly LlmRecovery[] {
++    return this.llmRecoveries.map((recovery) => ({
++      propose: (context) => {
++        let proposal: LoopLlmRecoveryProposal | undefined;
++        try {
++          proposal = recovery.propose({
++            error: {
++              kind: context.error.kind,
++              message: context.error.message,
++              finishReason:
++                'finishReason' in context.error ? context.error.finishReason : undefined,
++            },
++            messages: context.request.content.messages,
++            appliedRecoveries: context.appliedRecoveries,
++          });
++        } catch {
++          return undefined;
++        }
++        if (proposal === undefined) return undefined;
++        const appendMessages = proposal.appendMessages ?? [];
++        return {
++          strategy: proposal.strategy,
++          action: proposal.action,
++          rewrite:
++            appendMessages.length === 0
++              ? undefined
++              : (request) => ({
++                  ...request,
++                  content: {
++                    ...request.content,
++                    messages: [...request.content.messages, ...appendMessages],
++                  },
++                }),
++          beforeNextAttempt:
++            appendMessages.length === 0
++              ? undefined
++              : () => {
++                  this.pendingRecoveryMessages.push(...appendMessages);
++                  for (const message of appendMessages) {
++                    void this.dispatcher.dispatch(
++                      new ContextAppendMessage({ agentId: this.scopeContext.agentId, message }),
++                    );
++                  }
++                },
++        };
++      },
++    }));
++  }
++
++  private flushRecoveryMessages(beforeAssistant: boolean): void {
++    const pending = this.pendingRecoveryMessages;
++    if (pending.length === 0) return;
++    const loop = this.loop;
++    if (loop === undefined) return;
++    this.pendingRecoveryMessages = [];
++    const messages = loop.state.messages;
++    const index =
++      beforeAssistant && messages.at(-1)?.role === 'assistant' ? messages.length - 1 : messages.length;
++    const ack = loop.setContext([
++      ...messages.slice(0, index),
++      ...historyFromContext(pending),
++      ...messages.slice(index),
++    ], 'llm-recovery');
++    if (ack?.type === 'context.rejected') {
++      this.pendingRecoveryMessages = [...pending, ...this.pendingRecoveryMessages];
 +    }
-+    return undefined;
 +  }
 +
    private deleteErrorHandler(id: string): boolean {
      const index = this.errorHandlers.findIndex((entry) => entry.id === id);
      if (index < 0) return false;
-@@ -1576,11 +1612,14 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
-       case 'recovering': {
-         const turn = this.active;
-         const step = turn?.current;
-+        const recoveryMessages = this.pendingRecoveryMessages;
-+        this.pendingRecoveryMessages = [];
-         if (turn === undefined) return;
-         if (step !== undefined) {
-           this.closeFailedMachineStep(turn, step, 'error');
-         }
-         turn.current = undefined;
-+        for (const message of recoveryMessages) this.materializeMessage(message);
-         return;
+diff --git a/packages/agent-core-v2/src/agent/loop/turnProjection.ts b/packages/agent-core-v2/src/agent/loop/turnProjection.ts
+index 537f4ccbd67cef33728516e1bc0d571448a20760..d0d44b220dbc49febb9eb46ae0e24a06b3276e2d 100644
+--- a/packages/agent-core-v2/src/agent/loop/turnProjection.ts
++++ b/packages/agent-core-v2/src/agent/loop/turnProjection.ts
+@@ -356,7 +356,7 @@ export class AgentTurnProjection {
+         turn.forcedStopReason = context.stopReason;
+         return { type: 'done' as const, cause: { by: 'afterStep', reason: 'stop_turn' } };
        }
-       case 'retrying': {
-@@ -1877,7 +1916,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+-      if (finishReason === 'filtered') turn.filtered = true;
++      turn.filtered = finishReason === 'filtered';
+       return undefined;
      }
-     turn.interruptStep = undefined;
-     if (context.stopTurn) turn.stopRequested = true;
--    if (finishReason === 'filtered') turn.filtered = true;
-+    turn.filtered = finishReason === 'filtered';
-   }
- 
-   private async evaluateSettle(
-@@ -1902,7 +1941,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
-       await this.endTurn(turn, { type: 'cancelled', steps: turn.steps, reason });
-       return;
-     }
--    if (turn.filtered) {
-+    if (turn.filtered && !this.hasLiveNudge()) {
-       await this.endTurn(turn, {
-         type: 'failed',
-         steps: turn.steps,
+     const failure = turn.failedStep ?? { number: step.number, uuid: step.uuid, error: event.draft.error };
 diff --git a/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetry.ts b/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetry.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..2557cca8672a5ee49297a1d41c3050e01cf3dd88
@@ -625,13 +707,12 @@ index 0000000000000000000000000000000000000000..b779f46b91f74965f00550f5d087f15c
 +registerFeature(GeminiFilterRetryFeature);
 diff --git a/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryService.ts b/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryService.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..633c3b8fa9b7d91004de6a5a1601ee9b9a0217a0
+index 0000000000000000000000000000000000000000..892a81b2ee5f5ceeca19d79e960e11985f17275f
 --- /dev/null
 +++ b/packages/agent-core-v2/src/features/geminiFilterRetry/geminiFilterRetryService.ts
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,161 @@
 +import { createDecorator } from '#/_base/di/instantiation';
 +import { Service } from '#/_base/di/service';
-+import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 +import type { ContextMessage } from '#/agent/contextMemory/types';
 +import {
 +  IAgentLoopService,
@@ -658,6 +739,7 @@ index 0000000000000000000000000000000000000000..633c3b8fa9b7d91004de6a5a1601ee9b
 +  geminiFilterRetryAppliesTo,
 +  geminiFilterRetryPrompt,
 +  isGeminiBlockError,
++  isGeminiFilterRetryOrigin,
 +  isGeminiBlockReply,
 +  isGeminiModelName,
 +} from './geminiFilterRetry';
@@ -682,7 +764,6 @@ index 0000000000000000000000000000000000000000..633c3b8fa9b7d91004de6a5a1601ee9b
 +  return {
 +    role: 'user',
 +    content: [{ type: 'text', text: prompt }],
-+    toolCalls: [],
 +    origin: GEMINI_FILTER_RETRY_ORIGIN,
 +  };
 +}
@@ -697,7 +778,6 @@ index 0000000000000000000000000000000000000000..633c3b8fa9b7d91004de6a5a1601ee9b
 +    @IEventBus eventBus: IEventBus,
 +    @IAgentScopeContext private readonly scopeContext: IAgentScopeContext,
 +    @IAgentLoopService private readonly loop: IAgentLoopService,
-+    @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
 +    @IAgentProfileService private readonly profile: IAgentProfileService,
 +    @IModelCatalog private readonly catalog: IModelCatalog,
 +    @IConfigService private readonly configService: IConfigService,
@@ -705,7 +785,8 @@ index 0000000000000000000000000000000000000000..633c3b8fa9b7d91004de6a5a1601ee9b
 +  ) {
 +    super();
 +    this._register(
-+      eventBus.subscribe(TurnStarted, () => {
++      eventBus.subscribe(TurnStarted, (event) => {
++        if (isGeminiFilterRetryOrigin(event.origin)) return;
 +        this.attemptsInTurn = 0;
 +        this.gaveUpInTurn = false;
 +      }),
@@ -736,7 +817,7 @@ index 0000000000000000000000000000000000000000..633c3b8fa9b7d91004de6a5a1601ee9b
 +      if (!this.profile.hasModel()) return false;
 +      const alias = this.profile.getModel();
 +      const model = this.catalog.get(alias);
-+      return isGeminiModelName(alias, model.providerName, model.name);
++      return isGeminiModelName(alias, model.providerName, model.spec.name);
 +    } catch {
 +      return false;
 +    }
@@ -745,12 +826,12 @@ index 0000000000000000000000000000000000000000..633c3b8fa9b7d91004de6a5a1601ee9b
 +  private afterStep(step: AfterStepContext): void {
 +    if (!this.enabled() || step.signal.aborted || step.stopTurn) return;
 +    const blocked =
-+      lastAssistantBlockReply(this.context.get()) ||
++      lastAssistantBlockReply(this.loop.history()) ||
 +      (step.finishReason === 'filtered' && this.usesGeminiModel());
 +    if (!blocked) return;
 +    const prompt = this.nextPrompt();
 +    if (prompt === undefined) return;
-+    this.loop.notify({ message: retryMessage(prompt), turnScoped: true });
++    this.loop.notify({ message: retryMessage(prompt) });
 +  }
 +
 +  private proposeRetry(failure: LoopLlmRecoveryContext): LoopLlmRecoveryProposal | undefined {
@@ -792,7 +873,7 @@ index 0000000000000000000000000000000000000000..633c3b8fa9b7d91004de6a5a1601ee9b
 +  }
 +}
 diff --git a/packages/agent-core-v2/src/index.ts b/packages/agent-core-v2/src/index.ts
-index aeecfcd935b8a12572bc3ff606ce1aca13141aa9..5977dea496066d54462bc0fefd9134ba485d86dc 100644
+index 1854ba7182c6b1104c9f16be7ecaaa0e3d84eb5e..7dc6a75dbd7907f92e58eae75d74844646a59b31 100644
 --- a/packages/agent-core-v2/src/index.ts
 +++ b/packages/agent-core-v2/src/index.ts
 @@ -348,6 +348,9 @@ export * from '#/features/plan/plan';
@@ -806,22 +887,22 @@ index aeecfcd935b8a12572bc3ff606ce1aca13141aa9..5977dea496066d54462bc0fefd9134ba
  export * from '#/features/fileHistory/fileHistory';
  export * from '#/features/fileHistory/fileHistoryOps';
 diff --git a/packages/agent-core-v2/test/agent/loop/stubs.ts b/packages/agent-core-v2/test/agent/loop/stubs.ts
-index 5b71d3d03a94da23193d1c46a955f5d7ff50f96c..b7493c40764293739b5cb9c259bbfddd17f490a1 100644
+index 595686480dfe37b084c3e11bd9cebe4a190666cc..35363256c593868298bea0a66910298f97a3e50b 100644
 --- a/packages/agent-core-v2/test/agent/loop/stubs.ts
 +++ b/packages/agent-core-v2/test/agent/loop/stubs.ts
-@@ -202,6 +202,7 @@ export function stubLoopWithHooks(options: StubLoopOptions = {}): StubLoop {
-     attachEngine: () => stubAttachEngine(),
-     resetMachineEngine: () => Promise.resolve(),
+@@ -278,6 +278,7 @@ export function stubLoopWithHooks(options: StubLoopOptions = {}): StubLoop {
+     tryAcquireHistorySnapshot: () => toDisposable(() => {}),
+     resetLoop: () => Promise.resolve(),
      registerLoopErrorHandler: errorHandlers.register,
 +    registerLlmRecovery: () => toDisposable(() => {}),
-     settled: () => Promise.resolve(),
-     drainNextBatch(context) {
-       const batch = pending.splice(0);
+     settled: () => Promise.resolve(undefined),
+     retry: async () => { throw new Error('retry is not supported by this stub'); },
+     close: () => Promise.resolve(),
 diff --git a/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts b/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
-index e6aca0757aa33245784499d729414ffb6967a378..a89494aecd11055b0d67e47fb010269a36c84fb0 100644
+index c37bdada808193a4d930d4bac0b70032915efd9a..59dd6168fa0aca79b454fcd9a561383f4aab1392 100644
 --- a/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
 +++ b/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
-@@ -269,6 +269,10 @@ class FakeLoopService implements IAgentLoopService {
+@@ -344,6 +344,10 @@ class FakeLoopService extends StubEffectiveProfileReader implements IAgentLoopSe
    registerLoopErrorHandler(): IDisposable {
      throw new Error('unused in this suite');
    }
@@ -831,21 +912,20 @@ index e6aca0757aa33245784499d729414ffb6967a378..a89494aecd11055b0d67e47fb010269a
 +  }
  }
  
- class FakeContextMemory implements IAgentContextMemoryService {
+ class FakeContextMemory extends FakeLoopService {
 diff --git a/packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry.test.ts b/packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8b338c28b21e51afb69dc67ced05d8cf6533623
+index 0000000000000000000000000000000000000000..5ede4217b12d1d74da95f3e08a496f95199a8e2d
 --- /dev/null
 +++ b/packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry.test.ts
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,301 @@
 +import { afterEach, describe, expect, it } from 'vitest';
 +
 +import { TurnStarted } from '#/agent/loop/turnEvents';
 +import { WarningIssued } from '#/agent/profile/profileOps';
 +import { IEventBus } from '#/app/event/eventBus';
-+import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 +import type { ContextMessage } from '#/agent/contextMemory/types';
-+import { IAgentProfileService } from '#/agent/profile/profile';
++import { IAgentLoopService } from '#/agent/loop/loop';
 +import { IAgentLifecycleService } from '#/session/agentLifecycle/agentLifecycle';
 +import { runAgentTurn } from '#/session/subagent/runAgentTurn';
 +import {
@@ -858,7 +938,7 @@ index 0000000000000000000000000000000000000000..c8b338c28b21e51afb69dc67ced05d8c
 +  isGeminiFilterRetryOrigin,
 +} from '#/features/geminiFilterRetry/geminiFilterRetry';
 +
-+import { createTestAgent, type TestAgentContext } from '../../harness';
++import { createTestAgent, providerHttpError, type TestAgentContext } from '../../harness';
 +
 +const BLOCK_NOTICE =
 +  "This request was blocked by Gemini's filters. They can occasionally trigger by mistake on safe coding, security, or biology-related queries. Please try rephrasing your prompt. You can send feedback or read more about our policies here.";
@@ -985,8 +1065,9 @@ index 0000000000000000000000000000000000000000..c8b338c28b21e51afb69dc67ced05d8c
 +
 +    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Refactor the parser' }] });
 +    await ctx.untilTurnEnd();
++    await ctx.untilTurnEnd();
 +
-+    expect(events.started).toHaveLength(1);
++    expect(events.started).toHaveLength(2);
 +    const history = ctx.contextData().history;
 +    const retries = retryMessages(history);
 +    expect(retries).toHaveLength(1);
@@ -1004,7 +1085,7 @@ index 0000000000000000000000000000000000000000..c8b338c28b21e51afb69dc67ced05d8c
 +    ctx = createTestAgent();
 +    ctx.configure({ provider: GEMINI_PROVIDER });
 +    const events = watch(ctx);
-+    ctx.mockNextProviderResponse({ error: new Error(BLOCK_NOTICE) });
++    ctx.mockNextProviderResponse(providerHttpError(400, BLOCK_NOTICE));
 +    ctx.mockNextResponse({ type: 'text', text: 'Back on track.' });
 +
 +    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Audit the auth code' }] });
@@ -1027,7 +1108,7 @@ index 0000000000000000000000000000000000000000..c8b338c28b21e51afb69dc67ced05d8c
 +    ctx = createTestAgent();
 +    ctx.configure({ provider: GEMINI_PROVIDER });
 +    const events = watch(ctx);
-+    for (let index = 0; index < 6; index += 1) ctx.mockNextProviderResponse({ error: new Error(BLOCK_NOTICE) });
++    for (let index = 0; index < 6; index += 1) ctx.mockNextProviderResponse(providerHttpError(400, BLOCK_NOTICE));
 +
 +    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Audit the auth code' }] });
 +    await ctx.untilTurnEnd();
@@ -1044,9 +1125,9 @@ index 0000000000000000000000000000000000000000..c8b338c28b21e51afb69dc67ced05d8c
 +    for (let index = 0; index < 6; index += 1) ctx.mockNextResponse({ type: 'text', text: BLOCK_NOTICE });
 +
 +    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Write the mitigation' }] });
-+    await ctx.untilTurnEnd();
++    for (let index = 0; index < 6; index += 1) await ctx.untilTurnEnd();
 +
-+    expect(events.started).toHaveLength(1);
++    expect(events.started).toHaveLength(6);
 +    expect(retryMessages(ctx.contextData().history)).toHaveLength(5);
 +    expect(events.warnings.map((warning) => /\((\d)\/5\)/.exec(warning.message)?.[1] ?? 'stop')).toEqual([
 +      '1', '2', '3', '4', '5', 'stop',
@@ -1055,6 +1136,7 @@ index 0000000000000000000000000000000000000000..c8b338c28b21e51afb69dc67ced05d8c
 +    ctx.mockNextResponse({ type: 'text', text: BLOCK_NOTICE });
 +    ctx.mockNextResponse({ type: 'text', text: 'Done.' });
 +    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Try again' }] });
++    await ctx.untilTurnEnd();
 +    await ctx.untilTurnEnd();
 +    expect(events.warnings.at(-1)?.message).toContain('(1/5)');
 +    expect(textOf(ctx.contextData().history.at(-1))).toBe('Done.');
@@ -1065,14 +1147,14 @@ index 0000000000000000000000000000000000000000..c8b338c28b21e51afb69dc67ced05d8c
 +    const sub = await lifecycle.create({ agentId: 'agent-1' });
 +    const handle = lifecycle.handleOf(sub.agentId);
 +    if (handle === undefined) throw new Error('subagent handle missing');
-+    handle.accessor.get(IAgentProfileService).update({
++    handle.accessor.get(IAgentLoopService).update({
 +      modelAlias: 'mock-model',
 +      systemPrompt: 'You are a subagent.',
 +      thinkingLevel: 'off',
 +    });
 +    const run = await runAgentTurn(handle, { kind: 'prompt', prompt }, { signal: new AbortController().signal });
 +    const completion = await run.completion;
-+    const history = handle.accessor.get(IAgentContextMemoryService).get();
++    const history = handle.accessor.get(IAgentLoopService).history();
 +    await lifecycle.remove(sub);
 +    return { completion, history };
 +  }
@@ -1139,17 +1221,17 @@ index 0000000000000000000000000000000000000000..c8b338c28b21e51afb69dc67ced05d8c
 +  });
 +});
 diff --git a/packages/agent-core-v2/test/session/subagent/subagentScopeCache.test.ts b/packages/agent-core-v2/test/session/subagent/subagentScopeCache.test.ts
-index 55d3fd38946b77670c7f08bc8396cca3dcf0d1f7..4187741908899297ff8913911e0cb85561327518 100644
+index 5d82996cfe0f240c9b441210b0939e6d411b19d3..92257265fb8e76ab44b603fdbaaeaf6c09915e02 100644
 --- a/packages/agent-core-v2/test/session/subagent/subagentScopeCache.test.ts
 +++ b/packages/agent-core-v2/test/session/subagent/subagentScopeCache.test.ts
-@@ -461,6 +461,7 @@ describe('SessionSubagentScopeCacheService', () => {
+@@ -415,6 +415,7 @@ describe('SessionSubagentScopeCacheService', () => {
          onDidFinishStep: { register: () => ({ dispose: () => {} }) },
        },
        registerLoopErrorHandler: () => ({ dispose: () => {} }),
 +      registerLlmRecovery: () => ({ dispose: () => {} }),
+       start: async () => {},
        snapshot: () => ({
          state: 'idle',
-         queue: [],
 diff --git a/packages/kap-server/src/protocol/rest-config.ts b/packages/kap-server/src/protocol/rest-config.ts
 index 4394705ed8107d457a0f42df703b937a5746f92e..b25611d3d91ef8833e6d85d5a08c7f0cb84129d2 100644
 --- a/packages/kap-server/src/protocol/rest-config.ts
@@ -1170,19 +1252,19 @@ index 4394705ed8107d457a0f42df703b937a5746f92e..b25611d3d91ef8833e6d85d5a08c7f0c
  });
  export type PatchConfigRequest = z.infer<typeof patchConfigRequestSchema>;
 diff --git a/packages/node-sdk/src/config/schema.ts b/packages/node-sdk/src/config/schema.ts
-index b149791434980b6d98d6e98ffd0e86f107985538..07f65758c092cf591c02ed9ef76ddd264accd622 100644
+index 87318e892ef5b7573c8e90f2630ab0568af2c6ac..80761ff7e2dc7e08c994ba363470811da149915f 100644
 --- a/packages/node-sdk/src/config/schema.ts
 +++ b/packages/node-sdk/src/config/schema.ts
-@@ -314,6 +314,7 @@ export const KimiConfigSchema = z.object({
-   experimental: ExperimentalConfigSchema.optional(),
+@@ -324,6 +324,7 @@ export const KimiConfigSchema = z.object({
+   environments: EnvironmentsConfigSchema.optional(),
    telemetry: z.boolean().optional(),
    disableFeedbackSurvey: z.boolean().optional(),
 +  geminiFilterRetry: z.union([z.boolean(), z.literal('subagents')]).optional(),
    raw: z.record(z.string(), z.unknown()).optional(),
  });
  
-@@ -365,6 +366,7 @@ export const KimiConfigPatchSchema = z
-     experimental: ExperimentalConfigPatchSchema.optional(),
+@@ -376,6 +377,7 @@ export const KimiConfigPatchSchema = z
+     environments: EnvironmentsConfigSchema.optional(),
      telemetry: z.boolean().optional(),
      disableFeedbackSurvey: z.boolean().optional(),
 +    geminiFilterRetry: z.union([z.boolean(), z.literal('subagents')]).optional(),
@@ -1190,7 +1272,7 @@ index b149791434980b6d98d6e98ffd0e86f107985538..07f65758c092cf591c02ed9ef76ddd26
    .strict();
  
 diff --git a/packages/node-sdk/src/config/toml.ts b/packages/node-sdk/src/config/toml.ts
-index 71c8eaca85f25052b37386c16f3b6c3bb636ccb3..a9196d7abc84f3e27c53f054045c86030acced47 100644
+index 4d2408452dbb3a6144c63b0354b423f47275d447..c4a09f41d81568cd6c1203170ffe5eabe0406cda 100644
 --- a/packages/node-sdk/src/config/toml.ts
 +++ b/packages/node-sdk/src/config/toml.ts
 @@ -446,6 +446,7 @@ export function configToTomlData(config: KimiConfig): Record<string, unknown> {
@@ -1202,11 +1284,11 @@ index 71c8eaca85f25052b37386c16f3b6c3bb636ccb3..a9196d7abc84f3e27c53f054045c8603
    for (const key of scalarFields) {
      setDefined(out, camelToSnake(key), config[key]);
 diff --git a/packages/node-sdk/src/v2/config-mapper.ts b/packages/node-sdk/src/v2/config-mapper.ts
-index 89b23bad3a6ded5e2a3a56fdf982e6af1bb5dd8f..ffb5d84ad603e88cdfd1d8ade1155ba6eb3e40c1 100644
+index a77f3bd0c12fd393d5ac5e1667ab64aa491f85d3..a94c79d1de2654d3c40d068515a6c337b358a260 100644
 --- a/packages/node-sdk/src/v2/config-mapper.ts
 +++ b/packages/node-sdk/src/v2/config-mapper.ts
-@@ -46,6 +46,7 @@ const KIMI_CONFIG_DOMAINS = [
-   'experimental',
+@@ -47,6 +47,7 @@ const KIMI_CONFIG_DOMAINS = [
+   'environments',
    'telemetry',
    'disableFeedbackSurvey',
 +  'geminiFilterRetry',

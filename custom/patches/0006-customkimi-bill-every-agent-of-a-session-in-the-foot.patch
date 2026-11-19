@@ -1,7 +1,7 @@
-From b9d8646b162bb9e68969fd215e7799e5c7eecd70 Mon Sep 17 00:00:00 2001
+From b31e6f86dd054702d37e1bd09896a52dad29d967 Mon Sep 17 00:00:00 2001
 From: CustomKIMI <customkimi@localhost>
 Date: Fri, 16 Oct 2026 13:23:42 +0200
-Subject: [PATCH 07/13] customkimi: bill every agent of a session in the footer
+Subject: [PATCH 06/15] customkimi: bill every agent of a session in the footer
  cost
 
 The footer priced only the main agent's usage, so foreground, background
@@ -31,7 +31,7 @@ klient usage schema keeps the cost field.
  .changeset/session-cost-subagents.md          |   5 +
  .changeset/session-cost-unknown.md            |   5 +
  .../src/tui/components/chrome/footer.ts       |   4 +-
- .../tui/controllers/session-event-handler.ts  |   5 +
+ .../tui/controllers/session-event-handler.ts  |   3 +
  apps/kimi-code/src/tui/kimi-tui.ts            |   7 +
  apps/kimi-code/src/tui/types.ts               |   9 +-
  .../test/tui/components/chrome/footer.test.ts |  31 ++
@@ -39,22 +39,21 @@ klient usage schema keeps the cost field.
  .../test/tui/kimi-tui-startup.test.ts         |  37 ++
  .../src/agent/usage/usageEvents.ts            |   1 +
  .../src/features/usage/usageFeature.ts        |   2 +
- .../llm/requester/bases/anthropic/format.ts   |   2 +-
- .../llm/requester/bases/openai/format.ts      |   2 +-
- packages/agent-core-v2/src/human/llm/usage.ts |   3 +-
- .../src/human/test/llm/usage.test.ts          |   9 +
  packages/agent-core-v2/src/index.ts           |   1 +
  .../src/session/usage/sessionBilling.ts       |  47 ++
  .../session/usage/sessionBillingService.ts    | 167 +++++++
  .../test/agent/usage/sessionBilling.test.ts   | 421 ++++++++++++++++++
  .../llm-adapter/contract/usage-tokens.test.ts |   8 +
+ .../llm/builtin/protocol/anthropic/decode.ts  |   2 +-
+ .../src/llm/builtin/protocol/openai/decode.ts |   2 +-
+ packages/core/src/llm/usage.ts                |   3 +-
  packages/klient/src/contract/agent/schemas.ts |   1 +
  packages/node-sdk/src/sdk-rpc-client-v2.ts    |   6 +
  packages/node-sdk/src/types.ts                |   9 +
  packages/node-sdk/src/v2/session-wiring.ts    |  24 +
  .../node-sdk/test/session-billing.test.ts     | 294 ++++++++++++
  .../test/session-event-wiring.test.ts         |  69 ++-
- 26 files changed, 1211 insertions(+), 8 deletions(-)
+ 25 files changed, 1200 insertions(+), 8 deletions(-)
  create mode 100644 .changeset/session-cost-subagents.md
  create mode 100644 .changeset/session-cost-unknown.md
  create mode 100644 packages/agent-core-v2/src/session/usage/sessionBilling.ts
@@ -85,10 +84,10 @@ index 0000000000000000000000000000000000000000..5d341f58005ae1450adbd4c68c1bdb2d
 +
 +Stop counting requests without a reported cost as free in the footer's session cost.
 diff --git a/apps/kimi-code/src/tui/components/chrome/footer.ts b/apps/kimi-code/src/tui/components/chrome/footer.ts
-index 645a3d8d16cf532673dbc4df5520dcb2359939a1..577c66fd010bd782aa962f169e72601ad524b6fc 100644
+index fab3c0773347b3724cfc6e1208e985c6a955cc25..b19bf440e5f1cfee02c43ac480cab41bd740a4ce 100644
 --- a/apps/kimi-code/src/tui/components/chrome/footer.ts
 +++ b/apps/kimi-code/src/tui/components/chrome/footer.ts
-@@ -601,7 +601,9 @@ export class FooterComponent implements Component {
+@@ -595,7 +595,9 @@ export class FooterComponent implements Component {
      const resolve = modelResolver(state.availableModels, state.availableProviders);
      return {
        balance: this.billing.balanceFor(resolve(state.model).baseUrl),
@@ -100,34 +99,32 @@ index 645a3d8d16cf532673dbc4df5520dcb2359939a1..577c66fd010bd782aa962f169e72601a
    }
  
 diff --git a/apps/kimi-code/src/tui/controllers/session-event-handler.ts b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
-index b14c7f2ee2fe237b576eb319ba01cf674c5bc687..55790856f58f7c2090d7e62028b33a6a6fdb9ae2 100644
+index dcfd0fc8e1182afbf6c73b183e027d1a185143a2..417c29bcc48dcec698045ac0de549abfbdf9b82a 100644
 --- a/apps/kimi-code/src/tui/controllers/session-event-handler.ts
 +++ b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
-@@ -275,6 +275,11 @@ export class SessionEventHandler {
- 
+@@ -292,6 +292,9 @@ export class SessionEventHandler {
    handleEvent(event: Event, sendQueued: (item: QueuedMessage) => void): void {
+     if ('origin' in event && event.origin === 'shellCommand') return;
      this.notifications.handleEvent(event);
-+    // Session-wide billing covers every agent, so take it before child events
-+    // are routed away; it never touches the main agent's usage or context.
 +    if (event.type === 'agent.status.updated' && event.billingUsage !== undefined) {
 +      this.host.setAppState({ billingUsage: event.billingUsage });
 +    }
-     if (this.subAgentEventHandler.routeChildAgentEvent(event)) return;
- 
-     if ('turnId' in event && event.turnId !== undefined) {
+     if (event.type === 'background.task.started' || event.type === 'background.task.terminated') {
+       this.host.handleBackgroundTaskStatus?.(event.info);
+     }
 diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
-index 62a3fee61cdb09eaf4e887feb11039d578005f84..f391d6ba71d3837cba349adecee965238f3c78b1 100644
+index c7f7ce2428ec1aa3701192004641b63a370797b9..8673757bcfe04002714805ca6931a4527e07b758 100644
 --- a/apps/kimi-code/src/tui/kimi-tui.ts
 +++ b/apps/kimi-code/src/tui/kimi-tui.ts
-@@ -2924,6 +2924,7 @@ export class KimiTUI {
+@@ -3279,6 +3279,7 @@ export class KimiTUI {
        sessionId: session.id,
        cumulativeTokens: 0,
        sessionUsage: undefined,
 +      billingUsage: undefined,
      });
      this.session = session;
-     this.surveyController.seedUserTurnCount(initialUserTurnCount);
-@@ -2933,6 +2934,7 @@ export class KimiTUI {
+     this.hasSessionHistory = true;
+@@ -3289,6 +3290,7 @@ export class KimiTUI {
    }
  
    async syncRuntimeState(session: Session = this.requireSession()): Promise<void> {
@@ -135,7 +132,7 @@ index 62a3fee61cdb09eaf4e887feb11039d578005f84..f391d6ba71d3837cba349adecee96523
      const [status, goalResult] = await Promise.all([session.getStatus(), session.getGoal()]);
      this.setAppState({
        sessionId: session.id,
-@@ -2948,6 +2950,11 @@ export class KimiTUI {
+@@ -3304,6 +3306,11 @@ export class KimiTUI {
        cumulativeTokens:
          status.usage?.total === undefined ? 0 : sumTokenUsage(status.usage.total),
        sessionUsage: status.usage,
@@ -148,10 +145,10 @@ index 62a3fee61cdb09eaf4e887feb11039d578005f84..f391d6ba71d3837cba349adecee96523
        goal: goalResult.goal,
      });
 diff --git a/apps/kimi-code/src/tui/types.ts b/apps/kimi-code/src/tui/types.ts
-index 66a326257554667e8ee620a44569fa6c50f5a9e2..49286596c5edaa5ed0b180ff57b8c288d8af7625 100644
+index a0517950d8886a4e3da9d5ec7399b007f522d602..4d027a25b6b33ebb46899972b25d02529ee36f1f 100644
 --- a/apps/kimi-code/src/tui/types.ts
 +++ b/apps/kimi-code/src/tui/types.ts
-@@ -65,8 +65,15 @@ export interface AppState {
+@@ -56,8 +56,15 @@ export interface AppState {
    contextTokens: number;
    maxContextTokens: number;
    cumulativeTokens?: number;
@@ -169,10 +166,10 @@ index 66a326257554667e8ee620a44569fa6c50f5a9e2..49286596c5edaa5ed0b180ff57b8c288
    isReplaying: boolean;
    streamingPhase: 'idle' | 'waiting' | 'thinking' | 'composing' | 'shell';
 diff --git a/apps/kimi-code/test/tui/components/chrome/footer.test.ts b/apps/kimi-code/test/tui/components/chrome/footer.test.ts
-index e8636c52e52c509a18e22625fdc5ef2e393baa67..2e6d356ce48e4dd1100ec161728b7e56d3e95ec3 100644
+index 648afc57d7d1b72bd7036b2512c0968c8061eb8a..50a749f9ef78566bfd84f7351f64b6128082aec3 100644
 --- a/apps/kimi-code/test/tui/components/chrome/footer.test.ts
 +++ b/apps/kimi-code/test/tui/components/chrome/footer.test.ts
-@@ -268,6 +268,37 @@ describe('FooterComponent', () => {
+@@ -338,6 +338,37 @@ describe('FooterComponent', () => {
        footer.dispose();
      });
  
@@ -211,10 +208,10 @@ index e8636c52e52c509a18e22625fdc5ef2e393baa67..2e6d356ce48e4dd1100ec161728b7e56
        const billing = fakeBilling({});
        const start = vi.spyOn(billing, 'start');
 diff --git a/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts b/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
-index 1eb522ea1dbfa2aa0db80fd05a4bbc6702904932..237e5d0950696d9c3e99ef15d9c03262d648d66b 100644
+index ebd80f76b964bd74dda96e631e3a323336716c0b..0182d547e6812eaffc0538415ff754c3c2a55ff4 100644
 --- a/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
 +++ b/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
-@@ -92,6 +92,56 @@ describe('SessionEventHandler session usage', () => {
+@@ -90,6 +90,56 @@ describe('SessionEventHandler session usage', () => {
      );
      expect(host.state.appState.sessionUsage).toEqual(usage);
    });
@@ -272,10 +269,10 @@ index 1eb522ea1dbfa2aa0db80fd05a4bbc6702904932..237e5d0950696d9c3e99ef15d9c03262
  
  describe('SessionEventHandler compaction cache bookkeeping', () => {
 diff --git a/apps/kimi-code/test/tui/kimi-tui-startup.test.ts b/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
-index 6985fb0b96ca05c11e048528d107859a47fe3532..339ff2825a31fe5f918cd07eb93b10c954fdadef 100644
+index cee225ae634472a5bedb6aa915657bb7b1f09731..afc47b09c5b5e1d347d7df8ab1c80b10d406960d 100644
 --- a/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
 +++ b/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
-@@ -1007,6 +1007,43 @@ describe('KimiTUI startup', () => {
+@@ -1449,6 +1449,43 @@ describe('KimiTUI startup', () => {
      expect(driver.state.appState.goal).toEqual(goal);
    });
  
@@ -320,7 +317,7 @@ index 6985fb0b96ca05c11e048528d107859a47fe3532..339ff2825a31fe5f918cd07eb93b10c9
      const goal = goalSnapshot();
      const session = makeSession({
 diff --git a/packages/agent-core-v2/src/agent/usage/usageEvents.ts b/packages/agent-core-v2/src/agent/usage/usageEvents.ts
-index 33c5921093dbb6979be9af39c9422e090a2d66db..cabc0b1514306bc607cb09fa921cb7f4671b4d08 100644
+index dc5485df097dfc6e083262fa3ff84813576abd11..f902824d4783344da38a41efe46f8126c31b432a 100644
 --- a/packages/agent-core-v2/src/agent/usage/usageEvents.ts
 +++ b/packages/agent-core-v2/src/agent/usage/usageEvents.ts
 @@ -92,5 +92,6 @@ export interface AgentStatusUpdatedEvent {
@@ -350,74 +347,8 @@ index d22046eacb3419f9054402b621405f63ffa07158..83d51766c501ad2f61e5d14f261ff603
    }
  }
  
-diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts b/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts
-index 49859c08b5c57482c4baee64c9867c8d966907ce..138cd1282acb7f1aaeff61ee78661ceca784507d 100644
---- a/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts
-+++ b/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts
-@@ -98,7 +98,7 @@ function parseRawUsage(usage: AnthropicRawUsage | undefined): Partial<TokenUsage
-   }
-   const patch: Partial<TokenUsage> = {
-     raw: usage as Record<string, unknown>,
--    cost: typeof usage.cost === 'number' ? usage.cost : undefined,
-+    cost: typeof usage.cost === 'number' && Number.isFinite(usage.cost) ? usage.cost : undefined,
-   };
-   if (typeof usage.input_tokens === 'number') {
-     patch.inputOther = usage.input_tokens;
-diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts b/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
-index 32fa3679a286259fc5d19994ac8e1c704ba16581..bb1e4a7eeccf4dc4a1306e2a57660aecc9a9bb01 100644
---- a/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
-+++ b/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
-@@ -135,7 +135,7 @@ export function parseOpenAIUsage(usage: OpenAIRawUsage | null | undefined): Toke
-     inputCacheCreation: 0,
-     raw: usage as Record<string, unknown>,
-   };
--  if (usage.cost !== undefined) result.cost = usage.cost;
-+  if (typeof usage.cost === 'number' && Number.isFinite(usage.cost)) result.cost = usage.cost;
-   return result;
- }
- 
-diff --git a/packages/agent-core-v2/src/human/llm/usage.ts b/packages/agent-core-v2/src/human/llm/usage.ts
-index bd5bb8d955c9567132ada162eacd1425bc3ded83..aba39052cd1725ea60f38aaabd9cbb9f8b13918f 100644
---- a/packages/agent-core-v2/src/human/llm/usage.ts
-+++ b/packages/agent-core-v2/src/human/llm/usage.ts
-@@ -20,14 +20,13 @@ export function grandTotal(usage: TokenUsage): number {
- }
- 
- export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
--  const cost = a.cost === undefined && b.cost === undefined ? undefined : (a.cost ?? 0) + (b.cost ?? 0);
-   const result: TokenUsage = {
-     inputOther: a.inputOther + b.inputOther,
-     output: a.output + b.output,
-     inputCacheRead: a.inputCacheRead + b.inputCacheRead,
-     inputCacheCreation: a.inputCacheCreation + b.inputCacheCreation,
-   };
--  if (cost !== undefined) result.cost = cost;
-+  if (a.cost !== undefined && b.cost !== undefined) result.cost = a.cost + b.cost;
-   return result;
- }
- 
-diff --git a/packages/agent-core-v2/src/human/test/llm/usage.test.ts b/packages/agent-core-v2/src/human/test/llm/usage.test.ts
-index 5161d3f84c428b398d2b76d1badb0498c15ff4f2..afe38e4350fe11d9fa607d7705e3da8d936df860 100644
---- a/packages/agent-core-v2/src/human/test/llm/usage.test.ts
-+++ b/packages/agent-core-v2/src/human/test/llm/usage.test.ts
-@@ -50,6 +50,15 @@ describe('openAIFormat stream usage', () => {
-     parse({ usage: null }, sink);
-     expect(usages).toEqual([]);
-   });
-+
-+  it('treats a cost that is not a number as unreported', () => {
-+    const { sink, usages } = createSink();
-+    const parse = openAIFormat.createStreamParser();
-+    parse({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, cost: null } } as never, sink);
-+    parse({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, cost: '0.5' } } as never, sink);
-+    expect(usages.map((usage) => usage.cost)).toEqual([undefined, undefined]);
-+    expect(usages.every((usage) => !('cost' in usage))).toBe(true);
-+  });
- });
- 
- describe('openAI responses usage', () => {
 diff --git a/packages/agent-core-v2/src/index.ts b/packages/agent-core-v2/src/index.ts
-index a3e304095512cf15c286859d9db01bdf467150f4..aeecfcd935b8a12572bc3ff606ce1aca13141aa9 100644
+index 5d5d8e0606df33b431e12e06d736c498192957f8..1854ba7182c6b1104c9f16be7ecaaa0e3d84eb5e 100644
 --- a/packages/agent-core-v2/src/index.ts
 +++ b/packages/agent-core-v2/src/index.ts
 @@ -411,6 +411,7 @@ export * from '#/agent/usage/cacheProbeService';
@@ -425,18 +356,18 @@ index a3e304095512cf15c286859d9db01bdf467150f4..aeecfcd935b8a12572bc3ff606ce1aca
  export * from '#/session/usage/usageAgentModel';
  export * from '#/session/usage/sessionUsageService';
 +export * from '#/session/usage/sessionBillingService';
+ import '#/session/requestAttribution/requestAttributionService';
  import '#/features/usage/usageFeature';
  export * from '#/agent/toolDedupe/toolDedupe';
- export * from '#/agent/toolDedupe/toolDedupeService';
 diff --git a/packages/agent-core-v2/src/session/usage/sessionBilling.ts b/packages/agent-core-v2/src/session/usage/sessionBilling.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..1ace8550c35e947d46e2513c148a2b590b730758
+index 0000000000000000000000000000000000000000..f33da31f6bf05abc9c51b18867867bc3509db45a
 --- /dev/null
 +++ b/packages/agent-core-v2/src/session/usage/sessionBilling.ts
 @@ -0,0 +1,47 @@
 +import type { UsageStatus } from '#/agent/usage/usage';
 +import { copyUsage } from '#/agent/usage/usageOps';
-+import { addUsage, type TokenUsage } from '#human/llm/usage';
++import { addUsage, type TokenUsage } from '@moonshot-ai/core/llm/usage';
 +
 +export type UsageByModel = Readonly<Record<string, TokenUsage>>;
 +
@@ -483,7 +414,7 @@ index 0000000000000000000000000000000000000000..1ace8550c35e947d46e2513c148a2b59
 +}
 diff --git a/packages/agent-core-v2/src/session/usage/sessionBillingService.ts b/packages/agent-core-v2/src/session/usage/sessionBillingService.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..1f2638feb95d14796fbcebdd1315b28305a82b5f
+index 0000000000000000000000000000000000000000..ff20b485a510b80f4c226980d67096fb5ffe9767
 --- /dev/null
 +++ b/packages/agent-core-v2/src/session/usage/sessionBillingService.ts
 @@ -0,0 +1,167 @@
@@ -493,7 +424,7 @@ index 0000000000000000000000000000000000000000..1f2638feb95d14796fbcebdd1315b283
 +import { ILogService } from '#/_base/log/log';
 +import type { UsageStatus } from '#/agent/usage/usage';
 +import { UsageRecord } from '#/agent/usage/usageOps';
-+import type { TokenUsage } from '#human/llm/usage';
++import type { TokenUsage } from '@moonshot-ai/core/llm/usage';
 +import { IAppendLogStore } from '#/persistence/interface/appendLogStore';
 +import { ISessionContext } from '#/session/sessionContext/sessionContext';
 +import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
@@ -649,14 +580,14 @@ index 0000000000000000000000000000000000000000..1f2638feb95d14796fbcebdd1315b283
 +  return (
 +    typeof usage['inputOther'] === 'number' &&
 +    typeof usage['output'] === 'number' &&
-+    typeof usage['inputCacheRead'] === 'number' &&
++    (usage['inputCacheRead'] === undefined || typeof usage['inputCacheRead'] === 'number') &&
 +    typeof usage['inputCacheCreation'] === 'number' &&
 +    (usage['cost'] === undefined || (typeof usage['cost'] === 'number' && Number.isFinite(usage['cost'])))
 +  );
 +}
 diff --git a/packages/agent-core-v2/test/agent/usage/sessionBilling.test.ts b/packages/agent-core-v2/test/agent/usage/sessionBilling.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..cba9152ed1e3114e141b783ac84fe43885023d57
+index 0000000000000000000000000000000000000000..080ad0b263ec236493315b05207bc4f20369af75
 --- /dev/null
 +++ b/packages/agent-core-v2/test/agent/usage/sessionBilling.test.ts
 @@ -0,0 +1,421 @@
@@ -674,7 +605,7 @@ index 0000000000000000000000000000000000000000..cba9152ed1e3114e141b783ac84fe438
 +import { IEventBus, type ISessionEventBus } from '#/app/event/eventBus';
 +import { EventBusService } from '#/app/event/eventBusService';
 +import { ITelemetryService, noopTelemetryService } from '#/app/telemetry/telemetry';
-+import type { TokenUsage } from '#human/llm/usage';
++import type { TokenUsage } from '@moonshot-ai/core/llm/usage';
 +import { AppendLogStore } from '#/persistence/backends/node-fs/appendLogStore';
 +import { InMemoryStorageService } from '#/persistence/backends/memory/inMemoryStorageService';
 +import { InMemorySessionLockService } from '#/persistence/backends/memory/sessionLockService';
@@ -1082,10 +1013,10 @@ index 0000000000000000000000000000000000000000..cba9152ed1e3114e141b783ac84fe438
 +  });
 +});
 diff --git a/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts b/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts
-index adb4300a81d6240d9edac6e246bc2274cb43841a..53cb68f5a2abff19e66c0f2a5b59e688d7233fec 100644
+index 48ed1e7315aaa951326a0f62b49662d4322fc20a..cd890f8bf782fcf85d72721c63911d43355dbcf8 100644
 --- a/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts
 +++ b/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts
-@@ -37,6 +37,14 @@ describe('TokenUsage aggregation', () => {
+@@ -43,6 +43,14 @@ describe('TokenUsage aggregation', () => {
      expect(addUsage(emptyUsage(), emptyUsage()).cost).toBeUndefined();
    });
  
@@ -1097,34 +1028,81 @@ index adb4300a81d6240d9edac6e246bc2274cb43841a..53cb68f5a2abff19e66c0f2a5b59e688
 +    expect(addUsage({ ...emptyUsage(), cost: 0 }, { ...emptyUsage(), cost: 0 }).cost).toBe(0);
 +  });
 +
-   it('inputTotal sums all input counters, grandTotal adds output', () => {
+   it('inputTotal sums known input counters and preserves unknown totals', () => {
      const usage = { inputOther: 5, output: 7, inputCacheRead: 11, inputCacheCreation: 13 };
      expect(inputTotal(usage)).toBe(29);
+diff --git a/packages/core/src/llm/builtin/protocol/anthropic/decode.ts b/packages/core/src/llm/builtin/protocol/anthropic/decode.ts
+index 1c9e1f3f87ae2d0dcb34d897c14cb2450d2ea7c3..b6d448c966c2a090202904d128167f7998e32ddf 100644
+--- a/packages/core/src/llm/builtin/protocol/anthropic/decode.ts
++++ b/packages/core/src/llm/builtin/protocol/anthropic/decode.ts
+@@ -94,7 +94,7 @@ function parseUsage(usage: RawUsage | undefined): Partial<TokenUsage> | undefine
+   }
+   const patch: Partial<TokenUsage> = {
+     raw: usage as Record<string, unknown>,
+-    cost: typeof usage.cost === 'number' ? usage.cost : undefined,
++    cost: typeof usage.cost === 'number' && Number.isFinite(usage.cost) ? usage.cost : undefined,
+   };
+   if (typeof usage.input_tokens === 'number') {
+     patch.inputOther = usage.input_tokens;
+diff --git a/packages/core/src/llm/builtin/protocol/openai/decode.ts b/packages/core/src/llm/builtin/protocol/openai/decode.ts
+index 9affd17484bb4cccda09b2c8d205acb376de77eb..17100b0740dc4117129d8582d3f4fcd94297ac56 100644
+--- a/packages/core/src/llm/builtin/protocol/openai/decode.ts
++++ b/packages/core/src/llm/builtin/protocol/openai/decode.ts
+@@ -198,7 +198,7 @@ export function parseUsage(usage: RawUsage | null | undefined): Partial<TokenUsa
+     inputCacheCreation: 0,
+     raw: usage as Record<string, unknown>,
+   };
+-  if (usage.cost !== undefined) result.cost = usage.cost;
++  if (typeof usage.cost === 'number' && Number.isFinite(usage.cost)) result.cost = usage.cost;
+   return result;
+ }
+ 
+diff --git a/packages/core/src/llm/usage.ts b/packages/core/src/llm/usage.ts
+index 67f1e8f2aed6ec69c52587536944d041844a3d69..e2fcfa8eabfa855bad549e008215b340c6276031 100644
+--- a/packages/core/src/llm/usage.ts
++++ b/packages/core/src/llm/usage.ts
+@@ -22,7 +22,6 @@ export function grandTotal(usage: TokenUsage): number | undefined {
+ }
+ 
+ export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+-  const cost = a.cost === undefined && b.cost === undefined ? undefined : (a.cost ?? 0) + (b.cost ?? 0);
+   const result: TokenUsage = {
+     inputOther: a.inputOther + b.inputOther,
+     output: a.output + b.output,
+@@ -32,7 +31,7 @@ export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+         : a.inputCacheRead + b.inputCacheRead,
+     inputCacheCreation: a.inputCacheCreation + b.inputCacheCreation,
+   };
+-  if (cost !== undefined) result.cost = cost;
++  if (a.cost !== undefined && b.cost !== undefined) result.cost = a.cost + b.cost;
+   return result;
+ }
+ 
 diff --git a/packages/klient/src/contract/agent/schemas.ts b/packages/klient/src/contract/agent/schemas.ts
-index 6a4c793d726a099a203b097e47216b447a8f212d..225060ebab7b2ea75a72a80780f3a43d0772db26 100644
+index 35fa40716c7e4e357157d94370fbbea99736a455..2fe72fa065c842fe5fd81c9d0b2c6e2e21ae94c9 100644
 --- a/packages/klient/src/contract/agent/schemas.ts
 +++ b/packages/klient/src/contract/agent/schemas.ts
-@@ -124,6 +124,7 @@ export const tokenUsageSchema = z.object({
+@@ -113,6 +113,7 @@ export const tokenUsageSchema = z.object({
    output: z.number(),
-   inputCacheRead: z.number(),
+   inputCacheRead: z.number().optional(),
    inputCacheCreation: z.number(),
 +  cost: z.number().optional(),
  });
  
  export const usageStatusSchema = z.object({
 diff --git a/packages/node-sdk/src/sdk-rpc-client-v2.ts b/packages/node-sdk/src/sdk-rpc-client-v2.ts
-index 4051b61d0545ae48e099322787b019c560eec821..f01ab39c43dfc915807dd710266335eb0b861c59 100644
+index 8a84c8a61ce5d73f39adc59320246672fd9392d7..bdef70dbf2b516f56ae63e4b8aa1bcb57d8963ff 100644
 --- a/packages/node-sdk/src/sdk-rpc-client-v2.ts
 +++ b/packages/node-sdk/src/sdk-rpc-client-v2.ts
-@@ -165,6 +165,7 @@ import {
+@@ -186,6 +186,7 @@ import {
    IAgentSwarmService,
    IAgentTaskService,
    ISessionTokenCountingService,
 +  ISessionBillingService,
+   IAgentToolExecutorService,
    IAgentToolPolicyService,
    IAgentToolRegistryService,
-   type HostUiCapability,
-@@ -1985,6 +1986,10 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
+@@ -2204,6 +2205,10 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
     */
    override async getStatus(input: SessionIdRpcInput): Promise<SessionStatus> {
      const agent = await this.agentScope(input.sessionId);
@@ -1135,7 +1113,7 @@ index 4051b61d0545ae48e099322787b019c560eec821..f01ab39c43dfc915807dd710266335eb
      const facade = this.klient.session(input.sessionId).agent(this.interactiveAgentId);
      const [context, plan, usage] = await Promise.all([
        facade.getContext(),
-@@ -2011,6 +2016,7 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
+@@ -2228,6 +2233,7 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
        maxContextTokens,
        contextUsage,
        usage: hasUsage ? usage : undefined,
@@ -1144,10 +1122,10 @@ index 4051b61d0545ae48e099322787b019c560eec821..f01ab39c43dfc915807dd710266335eb
    }
  
 diff --git a/packages/node-sdk/src/types.ts b/packages/node-sdk/src/types.ts
-index 5b06fae432409ec574990d027492444b217b8876..ee0f1f9af623df46b0b74be0381596e860e005be 100644
+index a88157e7159df48343be80973ac40c2fd974d6b0..5aa3cae2786fba4c9cb7f4a585644e66cb8927b5 100644
 --- a/packages/node-sdk/src/types.ts
 +++ b/packages/node-sdk/src/types.ts
-@@ -427,7 +427,16 @@ export interface SessionStatus {
+@@ -533,7 +533,16 @@ export interface SessionStatus {
    readonly contextTokens: number;
    readonly maxContextTokens: number;
    readonly contextUsage: number;
@@ -1165,7 +1143,7 @@ index 5b06fae432409ec574990d027492444b217b8876..ee0f1f9af623df46b0b74be0381596e8
  
  /**
 diff --git a/packages/node-sdk/src/v2/session-wiring.ts b/packages/node-sdk/src/v2/session-wiring.ts
-index 5c8969313794c0dd03627ad1b45a9c604794c63f..7b8cd360afcac570688470f4bf2b49ff326d35d1 100644
+index af0f86792ac750d8afe43e6bcabc5f83fc61d227..076784fbad3679c3d01f80a3570833cd92c3071c 100644
 --- a/packages/node-sdk/src/v2/session-wiring.ts
 +++ b/packages/node-sdk/src/v2/session-wiring.ts
 @@ -35,6 +35,7 @@ import {
@@ -1507,10 +1485,10 @@ index 0000000000000000000000000000000000000000..a740b2a9b125fa63d2d355176eec7a27
 +  }
 +}
 diff --git a/packages/node-sdk/test/session-event-wiring.test.ts b/packages/node-sdk/test/session-event-wiring.test.ts
-index 34f8f2f3c9e98d4731733b4e138e20619784dbe6..361fa103ef887674bca52771f462a8351046c557 100644
+index cfee136cde5c6473f788c1b2a35e4ecda9119524..3bbea4512e793ea06973405c0e7398604c15cbb5 100644
 --- a/packages/node-sdk/test/session-event-wiring.test.ts
 +++ b/packages/node-sdk/test/session-event-wiring.test.ts
-@@ -16,6 +16,7 @@ import {
+@@ -8,6 +8,7 @@ import {
    IEventBus,
    ISessionTokenCountingService,
    ISessionUsageService,
@@ -1518,7 +1496,7 @@ index 34f8f2f3c9e98d4731733b4e138e20619784dbe6..361fa103ef887674bca52771f462a835
    makeAgentScopeContext,
    type ISessionScopeHandle,
  } from '@moonshot-ai/agent-core-v2';
-@@ -65,7 +66,10 @@ class FakeAgentHandle {
+@@ -53,7 +54,10 @@ class FakeAgentHandle {
    dispose(): void {}
  }
  
@@ -1530,7 +1508,7 @@ index 34f8f2f3c9e98d4731733b4e138e20619784dbe6..361fa103ef887674bca52771f462a835
    const lifecycle = {
      list: () => agents.map((agent) => agent.context),
      get: (agentId: string) => agents.find((agent) => agent.id === agentId)?.context,
-@@ -76,7 +80,7 @@ function makeSession(agents: FakeAgentHandle[]): ISessionScopeHandle {
+@@ -64,7 +68,7 @@ function makeSession(agents: FakeAgentHandle[]): ISessionScopeHandle {
    const accessor = {
      get: (token: unknown): unknown => {
        if (token === IAgentLifecycleService) return lifecycle;
@@ -1539,7 +1517,7 @@ index 34f8f2f3c9e98d4731733b4e138e20619784dbe6..361fa103ef887674bca52771f462a835
      },
    };
    return { id: 's1', kind: 1, accessor, dispose: () => {} } as unknown as ISessionScopeHandle;
-@@ -101,6 +105,10 @@ const USAGE = {
+@@ -89,6 +93,10 @@ const USAGE = {
    total: { inputOther: 1, output: 2, inputCacheRead: 0, inputCacheCreation: 0, cost: 0.25 },
  };
  
@@ -1549,9 +1527,9 @@ index 34f8f2f3c9e98d4731733b4e138e20619784dbe6..361fa103ef887674bca52771f462a835
 +
  function bindStatusServices(agent: FakeAgentHandle, model: string): void {
    agent.set(ISessionTokenCountingService, { statusSize: () => 10 });
-   agent.set(IAgentProfileService, {
-@@ -115,6 +123,63 @@ function bindStatusServices(agent: FakeAgentHandle, model: string): void {
- // ---------------------------------------------------------------------------
+   agent.set(IAgentLoopService, {
+@@ -99,6 +107,63 @@ function bindStatusServices(agent: FakeAgentHandle, model: string): void {
+ }
  
  describe('SessionEventWiring status snapshot fold', () => {
 +  it('forwards session billing on a main-agent status event that keeps the main snapshot', () => {

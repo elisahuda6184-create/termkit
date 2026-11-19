@@ -1,7 +1,7 @@
-From 9fa9c512dedbe2b644d6c3536468a53241cd15a2 Mon Sep 17 00:00:00 2001
+From 4ce4f1d11f571b53a1b393cf65b1ecfadd9b7dcf Mon Sep 17 00:00:00 2001
 From: CustomKIMI <customkimi@localhost>
 Date: Thu, 15 Oct 2026 13:21:47 +0200
-Subject: [PATCH 03/13] customkimi: add /wipe-all-sessions command
+Subject: [PATCH 03/15] customkimi: add /wipe-all-sessions command
 
 Delete every saved session across all workspaces through the harness session API. Requires '/wipe-all-sessions confirm'; without it only a warning is shown. If the current session is among those deleted, a fresh session starts.
 
@@ -15,10 +15,10 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  5 files changed, 62 insertions(+), 1 deletion(-)
 
 diff --git a/apps/kimi-code/src/tui/commands/dispatch.ts b/apps/kimi-code/src/tui/commands/dispatch.ts
-index 927e1fb8427136294df48a1d343ee58e923e3561..dea626ea28474bf565c49900af656e7fe60042f0 100644
+index 0259314c46b16cb93a9d493ded9e467b7a86a5c2..01f5799cb4fb9eed3b161fc625679ea628449e72 100644
 --- a/apps/kimi-code/src/tui/commands/dispatch.ts
 +++ b/apps/kimi-code/src/tui/commands/dispatch.ts
-@@ -63,6 +63,7 @@ import {
+@@ -69,6 +69,7 @@ import {
    handleForkCommand,
    handleInitCommand,
    handleTitleCommand,
@@ -26,7 +26,7 @@ index 927e1fb8427136294df48a1d343ee58e923e3561..dea626ea28474bf565c49900af656e7f
  } from './session';
  import { handleSwarmCommand } from './swarm';
  import { handleTowerCommand } from './tower';
-@@ -103,6 +104,7 @@ export {
+@@ -105,6 +106,7 @@ export {
    handleForkCommand,
    handleInitCommand,
    handleTitleCommand,
@@ -34,15 +34,15 @@ index 927e1fb8427136294df48a1d343ee58e923e3561..dea626ea28474bf565c49900af656e7f
  } from './session';
  export { handleUndoCommand } from './undo';
  export { handleRemoteControlCommand, handleWebCommand } from './web';
-@@ -193,6 +195,7 @@ export interface SlashCommandHost {
+@@ -169,6 +171,7 @@ export interface SlashCommandHost {
    setExitForegroundTask(task: (exitCode: number) => Promise<void>): void;
    showHelpPanel(): void;
    createNewSession(): Promise<void>;
 +  closeSessionForWipe(): Promise<void>;
    showSessionPicker(): Promise<void>;
-   sendNormalUserInput(text: string): void;
-   /**
-@@ -518,6 +521,9 @@ async function handleBuiltInSlashCommand(
+   sendNormalUserInput(text: string, preExtracted?: ExtractionResult, delivery?: FollowUpDelivery): void;
+   sendInlineSkillUserInput(
+@@ -476,6 +479,9 @@ async function handleBuiltInSlashCommand(
      case 'fork':
        await handleForkCommand(host, args);
        return;
@@ -71,10 +71,10 @@ index cdafaac1e6676784d9bfafc50cb000a50f3432c1..348774d2c0985cc30b959cfc12b71bb2
  export { handleRemoteControlCommand, handleWebCommand } from './web';
  export {
 diff --git a/apps/kimi-code/src/tui/commands/registry.ts b/apps/kimi-code/src/tui/commands/registry.ts
-index e4ad7ab4807df8f556a7e9b090520db78b6f2c85..fa87b3f8c6dbd5e01211253f4fa1dd695d985d0c 100644
+index 4ca9930bc1129fc211857fd391aa0578998049c4..f05c72587305efe5bd55c58588711a2b20df9a62 100644
 --- a/apps/kimi-code/src/tui/commands/registry.ts
 +++ b/apps/kimi-code/src/tui/commands/registry.ts
-@@ -256,6 +256,13 @@ export const BUILTIN_SLASH_COMMANDS = [
+@@ -248,6 +248,13 @@ export const BUILTIN_SLASH_COMMANDS = [
      description: 'Browse and resume sessions',
      priority: 80,
    },
@@ -89,12 +89,12 @@ index e4ad7ab4807df8f556a7e9b090520db78b6f2c85..fa87b3f8c6dbd5e01211253f4fa1dd69
      name: 'tasks',
      aliases: ['task'],
 diff --git a/apps/kimi-code/src/tui/commands/session.ts b/apps/kimi-code/src/tui/commands/session.ts
-index 67f3600101e903ea2454f99c0fa85b5a19aab668..d36b1e3484006263465482b95255959c818c0f70 100644
+index 7c156befeaa05e89fe930b6370969271d6faa756..e51178e4959ebaf120446be1816d0593d44f9053 100644
 --- a/apps/kimi-code/src/tui/commands/session.ts
 +++ b/apps/kimi-code/src/tui/commands/session.ts
-@@ -17,6 +17,43 @@ import type { SlashCommandHost } from './dispatch';
- // Session commands
- // ---------------------------------------------------------------------------
+@@ -14,6 +14,43 @@ import { buildExportMarkdown } from '../utils/export-markdown';
+ import { sessionWorkDir } from '../utils/session-work-dir';
+ import type { SlashCommandHost } from './dispatch';
  
 +export async function handleWipeAllSessionsCommand(
 +  host: SlashCommandHost,
@@ -137,10 +137,10 @@ index 67f3600101e903ea2454f99c0fa85b5a19aab668..d36b1e3484006263465482b95255959c
    const title = args.trim();
    if (title.length === 0) {
 diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
-index 748d8a914331f4e3a2c5ea84de398e69cc147b5b..8c270056fe14c69f50bdf82f18c069f000721c5c 100644
+index 642e988510a377fd50d6cd081d761ef9011c3d0d..8311dd7bc355fce25e5a4effee19d9c19e95b811 100644
 --- a/apps/kimi-code/src/tui/kimi-tui.ts
 +++ b/apps/kimi-code/src/tui/kimi-tui.ts
-@@ -2967,6 +2967,12 @@ export class KimiTUI {
+@@ -3346,6 +3346,12 @@ export class KimiTUI {
      this.staging.releaseAll();
    }
  

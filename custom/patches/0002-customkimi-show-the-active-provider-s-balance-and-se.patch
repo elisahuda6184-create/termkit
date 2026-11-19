@@ -1,14 +1,14 @@
-From 2742f17b753b211a2c86caa7ff004cd0edfc1c85 Mon Sep 17 00:00:00 2001
+From 8c1a2507643df5a5ccf3c376beef0ace0b53a767 Mon Sep 17 00:00:00 2001
 From: CustomKIMI <customkimi@localhost>
 Date: Thu, 15 Oct 2026 13:21:47 +0200
-Subject: [PATCH 02/13] customkimi: show the active provider's balance and
+Subject: [PATCH 02/15] customkimi: show the active provider's balance and
  session cost in the footer
 
 Show the account balance of the provider that serves the active model (ClosedRouter or 7api) next to context usage, plus the cost of the current session. Providers are BillingProvider subclasses in utils/billing (ClosedRouterBilling, SevenApiBilling), registered in providers.ts. BillingMonitor polls balances every 60 seconds and price lists every 10 minutes. Session cost adds the usage.cost that ClosedRouter reports and prices the remaining models from their provider's published per-model prices (7api /v1/models); it is hidden when any model cannot be priced. The optional CLOSEROUTER_*_USD_PER_MILLION rates still price ClosedRouter requests without a cost. Also fills a usage slot for status_line templates.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---
- .../src/tui/components/chrome/footer.ts       |  72 +++++--
+ .../src/tui/components/chrome/footer.ts       |  73 ++++++--
  .../tui/controllers/session-event-handler.ts  |   1 +
  apps/kimi-code/src/tui/kimi-tui.ts            |   7 +
  apps/kimi-code/src/tui/types.ts               |   3 +
@@ -21,7 +21,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  .../session-event-handler-compaction.test.ts  |  14 ++
  .../utils/billing/billing-monitor.test.ts     | 176 ++++++++++++++++++
  .../utils/billing/billing-providers.test.ts   | 137 ++++++++++++++
- 13 files changed, 835 insertions(+), 11 deletions(-)
+ 13 files changed, 836 insertions(+), 11 deletions(-)
  create mode 100644 apps/kimi-code/src/utils/billing/billing-monitor.ts
  create mode 100644 apps/kimi-code/src/utils/billing/billing-provider.ts
  create mode 100644 apps/kimi-code/src/utils/billing/closedrouter.ts
@@ -31,12 +31,12 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  create mode 100644 apps/kimi-code/test/utils/billing/billing-providers.test.ts
 
 diff --git a/apps/kimi-code/src/tui/components/chrome/footer.ts b/apps/kimi-code/src/tui/components/chrome/footer.ts
-index d9fd3868f33618704b7428ecdb03d8be47e34c0f..645a3d8d16cf532673dbc4df5520dcb2359939a1 100644
+index 6d566edc0a75916bed319f5c826567dd73a3b804..fab3c0773347b3724cfc6e1208e985c6a955cc25 100644
 --- a/apps/kimi-code/src/tui/components/chrome/footer.ts
 +++ b/apps/kimi-code/src/tui/components/chrome/footer.ts
-@@ -28,6 +28,13 @@ import {
-   type GitStatus,
+@@ -24,6 +24,13 @@ import {
    type GitStatusCache,
+   type GitStatusSource,
  } from '#/utils/git/git-status';
 +import {
 +  BillingMonitor,
@@ -48,38 +48,33 @@ index d9fd3868f33618704b7428ecdb03d8be47e34c0f..645a3d8d16cf532673dbc4df5520dcb2
  import {
    formatTokenCount,
    usagePercent,
-@@ -213,8 +220,13 @@ export class FooterComponent implements Component {
-    */
+@@ -194,8 +201,14 @@ export class FooterComponent implements Component {
+   private statusLineRunner: StatusLineCommandRunner | null = null;
    private backgroundBashTaskCount = 0;
    private backgroundAgentCount = 0;
+-
+-  constructor(state: AppState, onRefresh: () => void = () => {}, runningFullscreen = false) {
 +  private readonly billing: BillingSource;
- 
--  constructor(state: AppState, onRefresh: () => void = () => {}) {
++
 +  constructor(
 +    state: AppState,
 +    onRefresh: () => void = () => {},
++    runningFullscreen = false,
 +    billing: BillingSource = new BillingMonitor(createBillingProviders(), { onUpdate: onRefresh }),
 +  ) {
      this.state = state;
      this.onRefresh = onRefresh;
-     this.gitCacheWorkDir = state.workDir;
-@@ -224,6 +236,8 @@ export class FooterComponent implements Component {
-     this.syncGoalClock(state.goal);
+     this.runningFullscreen = runningFullscreen;
+@@ -203,6 +216,8 @@ export class FooterComponent implements Component {
      this.syncGoalTimer(state.goal);
+     this.syncEnvironmentSpinner(state.environment);
      this.syncStatusLineRunner(state);
 +    this.billing = billing;
 +    this.billing.start();
    }
  
    setState(state: AppState): void {
-@@ -368,35 +382,48 @@ export class FooterComponent implements Component {
-       }
-     }
- 
--    // ── Line 2: hint (bottom-left) + context (right) ──
-+    // ── Line 2: hint (bottom-left) + billing/context (right) ──
-     const contextText = formatContextStatus(
-       state.contextUsage,
+@@ -334,27 +349,40 @@ export class FooterComponent implements Component {
        state.contextTokens,
        state.maxContextTokens,
      );
@@ -116,8 +111,6 @@ index d9fd3868f33618704b7428ecdb03d8be47e34c0f..645a3d8d16cf532673dbc4df5520dcb2
 -        chalk.hex(colors.text)(contextText);
 +        chalk.hex(colors.warning).bold(shownHint) + ' '.repeat(pad) + rightText;
      } else {
-       // A status_line.command owns line 1 outright, so the ctrl+o hint moves
-       // down here; the transient and warning hints above take precedence.
        const shortcut = customLine !== null ? this.expandShortcut() : null;
        const left =
 -        shortcut !== null && visibleWidth(shortcut) + 1 + contextWidth <= width
@@ -131,16 +124,16 @@ index d9fd3868f33618704b7428ecdb03d8be47e34c0f..645a3d8d16cf532673dbc4df5520dcb2
      }
  
      return [truncateToWidth(line1, width), truncateToWidth(line2, width)];
-@@ -438,6 +465,7 @@ export class FooterComponent implements Component {
-       tasks: [],
+@@ -391,6 +419,7 @@ export class FooterComponent implements Component {
+       environment: [],
        cwd: [],
        git: [],
 +      usage: [],
        tips: [],
      };
  
-@@ -505,6 +533,16 @@ export class FooterComponent implements Component {
-     const git = this.gitCache.getStatus();
+@@ -485,6 +514,16 @@ export class FooterComponent implements Component {
+     const git = this.gitCache?.getStatus() ?? null;
      if (git !== null) slots['git'] = [formatFooterGitBadge(git, colors)];
  
 +    const { balance, sessionCostUsd } = this.billingStatus(state);
@@ -156,10 +149,10 @@ index d9fd3868f33618704b7428ecdb03d8be47e34c0f..645a3d8d16cf532673dbc4df5520dcb2
      return slots;
    }
  
-@@ -553,6 +591,18 @@ export class FooterComponent implements Component {
-       clearInterval(this.goalTimer);
+@@ -546,6 +585,18 @@ export class FooterComponent implements Component {
        this.goalTimer = null;
      }
+     this.environmentSpinner.dispose();
 +    this.billing.stop();
 +  }
 +
@@ -176,10 +169,10 @@ index d9fd3868f33618704b7428ecdb03d8be47e34c0f..645a3d8d16cf532673dbc4df5520dcb2
  
    private goalWallClockMs(goal: AppState['goal']): number | undefined {
 diff --git a/apps/kimi-code/src/tui/controllers/session-event-handler.ts b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
-index c227a0c51da1c94321be36ece136096ab1bc44be..b14c7f2ee2fe237b576eb319ba01cf674c5bc687 100644
+index 34dc6f8ad503cf20c5e9301cb15ddf1879c661ff..dcfd0fc8e1182afbf6c73b183e027d1a185143a2 100644
 --- a/apps/kimi-code/src/tui/controllers/session-event-handler.ts
 +++ b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
-@@ -768,6 +768,7 @@ export class SessionEventHandler {
+@@ -787,6 +787,7 @@ export class SessionEventHandler {
      if (event.thinkingEffort !== undefined) patch.thinkingEffort = event.thinkingEffort;
      if (event.usage?.total !== undefined) {
        patch.cumulativeTokens = sumTokenUsage(event.usage.total);
@@ -188,10 +181,10 @@ index c227a0c51da1c94321be36ece136096ab1bc44be..b14c7f2ee2fe237b576eb319ba01cf67
      if (Object.keys(patch).length > 0) this.host.setAppState(patch);
      if (event.swarmMode === false) {
 diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
-index 7a9feff8dea2ed9fed874306a6a5e826a4fb6012..748d8a914331f4e3a2c5ea84de398e69cc147b5b 100644
+index 9ad881520d1092ccc92acf639ba8d07bf1d466b3..642e988510a377fd50d6cd081d761ef9011c3d0d 100644
 --- a/apps/kimi-code/src/tui/kimi-tui.ts
 +++ b/apps/kimi-code/src/tui/kimi-tui.ts
-@@ -290,6 +290,7 @@ function createInitialAppState(input: KimiTUIStartupInput): AppState {
+@@ -321,6 +321,7 @@ function createInitialAppState(input: KimiTUIStartupInput): AppState {
      contextTokens: 0,
      maxContextTokens: 0,
      cumulativeTokens: 0,
@@ -199,9 +192,9 @@ index 7a9feff8dea2ed9fed874306a6a5e826a4fb6012..748d8a914331f4e3a2c5ea84de398e69
      isCompacting: false,
      isReplaying: false,
      streamingPhase: 'idle',
-@@ -2885,6 +2886,11 @@ export class KimiTUI {
-     // would delete the staged media (e.g. a pasted image's daemon upload)
-     // before the engine's intake can read it.
+@@ -3240,6 +3241,11 @@ export class KimiTUI {
+     const previous = this.unloadCurrentSession('switching session');
+     await previous?.close();
      if (previous !== undefined) this.staging.releaseAll();
 +    this.setAppState({
 +      sessionId: session.id,
@@ -209,9 +202,9 @@ index 7a9feff8dea2ed9fed874306a6a5e826a4fb6012..748d8a914331f4e3a2c5ea84de398e69
 +      sessionUsage: undefined,
 +    });
      this.session = session;
+     this.hasSessionHistory = true;
      this.surveyController.seedUserTurnCount(initialUserTurnCount);
-     this.harness.setTelemetryContext({ sessionId: session.id });
-@@ -2907,6 +2913,7 @@ export class KimiTUI {
+@@ -3263,6 +3269,7 @@ export class KimiTUI {
        contextUsage: status.contextUsage,
        cumulativeTokens:
          status.usage?.total === undefined ? 0 : sumTokenUsage(status.usage.total),
@@ -220,18 +213,18 @@ index 7a9feff8dea2ed9fed874306a6a5e826a4fb6012..748d8a914331f4e3a2c5ea84de398e69
        goal: goalResult.goal,
      });
 diff --git a/apps/kimi-code/src/tui/types.ts b/apps/kimi-code/src/tui/types.ts
-index 24347ace863b1db27bcf47b57b16585f75572c3c..66a326257554667e8ee620a44569fa6c50f5a9e2 100644
+index b931b0cea9738a3777aecd6e1d5b83f80ad8f1d1..a0517950d8886a4e3da9d5ec7399b007f522d602 100644
 --- a/apps/kimi-code/src/tui/types.ts
 +++ b/apps/kimi-code/src/tui/types.ts
-@@ -5,6 +5,7 @@ import type {
-   PermissionMode,
-   ProviderConfig,
+@@ -7,6 +7,7 @@ import type {
    PromptPart,
+   SessionEnvironmentStatus,
+   SessionEnvironmentType,
 +  SessionUsage,
    ThinkingEffort,
    TokenUsage,
    ToolInputDisplay,
-@@ -64,6 +65,8 @@ export interface AppState {
+@@ -55,6 +56,8 @@ export interface AppState {
    contextTokens: number;
    maxContextTokens: number;
    cumulativeTokens?: number;
@@ -607,10 +600,10 @@ index 0000000000000000000000000000000000000000..15eb8e3c12c0cdc593b68b4310191745
 +  }
 +}
 diff --git a/apps/kimi-code/test/tui/components/chrome/footer.test.ts b/apps/kimi-code/test/tui/components/chrome/footer.test.ts
-index a5506500d8acf6911025a38e6dfe4f3791152474..e8636c52e52c509a18e22625fdc5ef2e393baa67 100644
+index 211fdb67f98c90a609ea7fed45a795482cc50eda..648afc57d7d1b72bd7036b2512c0968c8061eb8a 100644
 --- a/apps/kimi-code/test/tui/components/chrome/footer.test.ts
 +++ b/apps/kimi-code/test/tui/components/chrome/footer.test.ts
-@@ -6,6 +6,8 @@ import { setRainbowDance, type RainbowDanceController } from '#/tui/easter-eggs/
+@@ -12,6 +12,8 @@ import { setRainbowDance, type RainbowDanceController } from '#/tui/easter-eggs/
  import { currentTheme, darkColors, lightColors } from '#/tui/theme';
  import type { ModelAlias } from '@moonshot-ai/kimi-code-sdk';
  import type { AppState } from '#/tui/types';
@@ -619,7 +612,7 @@ index a5506500d8acf6911025a38e6dfe4f3791152474..e8636c52e52c509a18e22625fdc5ef2e
  
  const gitStatusMocks = vi.hoisted(() => ({
    createGitStatusCache: vi.fn(),
-@@ -179,6 +181,104 @@ describe('FooterComponent', () => {
+@@ -249,6 +251,104 @@ describe('FooterComponent', () => {
      expect(rendered).not.toContain('thinking:high');
    });
  
@@ -648,7 +641,7 @@ index a5506500d8acf6911025a38e6dfe4f3791152474..e8636c52e52c509a18e22625fdc5ef2e
 +
 +    it('shows the balance of the provider billing the active model and the session cost', () => {
 +      const billing = fakeBilling({ 'https://7api.st/v1': { label: '7api', usd: 9.18 } }, 1.2345);
-+      const footer = new FooterComponent(sevenApiState, () => {}, billing);
++      const footer = new FooterComponent(sevenApiState, () => {}, false, billing);
 +      const rendered = plain(footer);
 +      expect(rendered).toContain('7api balance $9.18');
 +      expect(rendered).toContain('session cost $1.2345');
@@ -671,14 +664,14 @@ index a5506500d8acf6911025a38e6dfe4f3791152474..e8636c52e52c509a18e22625fdc5ef2e
 +        'https://api.closerouter.dev/v1': { label: 'ClosedRouter', usd: 18.2 },
 +        'https://7api.st/v1': { label: '7api', usd: 9.18 },
 +      });
-+      const footer = new FooterComponent(state, () => {}, billing);
++      const footer = new FooterComponent(state, () => {}, false, billing);
 +      expect(plain(footer)).toContain('ClosedRouter balance $18.20');
 +      expect(plain(footer)).not.toContain('7api balance');
 +      footer.dispose();
 +    });
 +
 +    it('shows no balance or cost when billing has none', () => {
-+      const footer = new FooterComponent(sevenApiState, () => {}, fakeBilling({}));
++      const footer = new FooterComponent(sevenApiState, () => {}, false, fakeBilling({}));
 +      const rendered = plain(footer);
 +      expect(rendered).not.toContain('balance $');
 +      expect(rendered).not.toContain('session cost');
@@ -703,7 +696,7 @@ index a5506500d8acf6911025a38e6dfe4f3791152474..e8636c52e52c509a18e22625fdc5ef2e
 +        ...sevenApiState,
 +        sessionUsage: { total: turn, byModel: { '7api/gpt-6-astra': turn } },
 +      };
-+      const footer = new FooterComponent(state, () => {}, monitor);
++      const footer = new FooterComponent(state, () => {}, false, monitor);
 +      const rendered = plain(footer);
 +      expect(rendered).toContain('7api balance $9.18');
 +      expect(rendered).toContain('session cost $0.0013');
@@ -714,7 +707,7 @@ index a5506500d8acf6911025a38e6dfe4f3791152474..e8636c52e52c509a18e22625fdc5ef2e
 +      const billing = fakeBilling({});
 +      const start = vi.spyOn(billing, 'start');
 +      const stop = vi.spyOn(billing, 'stop');
-+      const footer = new FooterComponent(appState, () => {}, billing);
++      const footer = new FooterComponent(appState, () => {}, false, billing);
 +      expect(start).toHaveBeenCalledTimes(1);
 +      footer.dispose();
 +      expect(stop).toHaveBeenCalledTimes(1);
@@ -725,10 +718,10 @@ index a5506500d8acf6911025a38e6dfe4f3791152474..e8636c52e52c509a18e22625fdc5ef2e
      const on = new FooterComponent({ ...appState, towerMode: true });
      expect(on.render(120).join('\n')).toContain('tower');
 diff --git a/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts b/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
-index 75f3146c10571076065fe582f46f2af6908df320..1eb522ea1dbfa2aa0db80fd05a4bbc6702904932 100644
+index ea4d07367e1f1531068a1984704bc12f8f4be643..ebd80f76b964bd74dda96e631e3a323336716c0b 100644
 --- a/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
 +++ b/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
-@@ -80,6 +80,20 @@ const compactionCancelled = {
+@@ -78,6 +78,20 @@ const compactionCancelled = {
    agentId: 'main',
  } as const;
  

@@ -1,16 +1,16 @@
-From 76c96946268cbfdf78e34cd1c0fc5a7115209610 Mon Sep 17 00:00:00 2001
+From fce680ba9e55ca2949a78a3f0a267c4892b87e66 Mon Sep 17 00:00:00 2001
 From: Administrator <administrator@Mac.lan>
 Date: Thu, 22 Oct 2026 16:04:23 +0200
-Subject: [PATCH 09/13] customkimi: refresh OpenRouter model limits and efforts
+Subject: [PATCH 08/15] customkimi: refresh OpenRouter model limits and efforts
  at startup
 
 Aliases whose endpoint is https://openrouter.ai/api/v1 take context and output limits and reasoning efforts from OpenRouter's public model list (no key sent), using the CloseRouter refresh rules. Runs as branch 1.6 of refreshProviderModels.
 ---
  packages/oauth/src/closerouter.ts           |  30 +-
  packages/oauth/src/openrouter.ts            | 334 +++++++++
- packages/oauth/src/refreshProviderModels.ts |  49 +-
+ packages/oauth/src/refreshProviderModels.ts |  41 +-
  packages/oauth/test/openrouter.test.ts      | 729 ++++++++++++++++++++
- 4 files changed, 1116 insertions(+), 26 deletions(-)
+ 4 files changed, 1108 insertions(+), 26 deletions(-)
  create mode 100644 packages/oauth/src/openrouter.ts
  create mode 100644 packages/oauth/test/openrouter.test.ts
 
@@ -487,7 +487,7 @@ index 0000000000000000000000000000000000000000..4072f739ab2337096b5c4566e730d09f
 +  return catalog;
 +}
 diff --git a/packages/oauth/src/refreshProviderModels.ts b/packages/oauth/src/refreshProviderModels.ts
-index 924cb4c344429ec31f91f59d1f364ba55924fad2..cc1656de7064d1ca26a42ad39497459c9ad2b8b8 100644
+index 45a5c00cde778928017e5af32ad3d425c35dd219..abacd5c19baa1d211c452436db1849db699e666f 100644
 --- a/packages/oauth/src/refreshProviderModels.ts
 +++ b/packages/oauth/src/refreshProviderModels.ts
 @@ -1,4 +1,4 @@
@@ -504,11 +504,10 @@ index 924cb4c344429ec31f91f59d1f364ba55924fad2..cc1656de7064d1ca26a42ad39497459c
  import {
    declaredProviderCredential,
    apiKeyEnvMissingMessage,
-@@ -420,6 +421,21 @@ function pickDefaultModel(
+@@ -377,6 +378,20 @@ function pickDefaultModel(
    return firstModel.id;
  }
  
-+/** A metadata-only refresh (CloseRouter, OpenRouter) reported as a change that names what it updated. */
 +function metadataChange(
 +  { providerId, aliases, limits, efforts }: CloseRouterProviderChange,
 +  source: string,
@@ -523,20 +522,10 @@ index 924cb4c344429ec31f91f59d1f364ba55924fad2..cc1656de7064d1ca26a42ad39497459c
 +  };
 +}
 +
- /**
-  * Refresh remote model metadata for the configured providers and persist any
-  * changes through the host. Handles four provider kinds, in order:
-@@ -427,6 +443,9 @@ function pickDefaultModel(
-  *  1. Managed Kimi Code (OAuth) — `GET /models` against the runtime endpoint.
-  *  1.5. CloseRouter — limits and endpoint efforts of the configured aliases
-  *     whose endpoint is CloseRouter; never adds or removes aliases.
-+ *  1.6. OpenRouter — limits and efforts of the configured aliases whose
-+ *     endpoint is OpenRouter, from its public catalog; never adds or removes
-+ *     aliases.
-  *  2. Open platforms (moonshot-cn, moonshot-ai, …) — platform catalog fetch.
-  *  2.5. Managed-endpoint API-key providers — hand-written `type: 'kimi'`
-  *     providers (including a hand-written `managed:kimi-code` without an oauth
-@@ -548,16 +567,7 @@ export async function refreshProviderModels(
+ export async function refreshProviderModels(
+   host: RefreshProviderHost,
+   options: RefreshProviderOptions = {},
+@@ -473,16 +488,7 @@ export async function refreshProviderModels(
    try {
      const closeRouter = await refreshCloseRouterModels(host, config, { providerId: targetId });
      config = closeRouter.config;
@@ -554,14 +543,10 @@ index 924cb4c344429ec31f91f59d1f364ba55924fad2..cc1656de7064d1ca26a42ad39497459c
      unchanged.push(...closeRouter.unchanged);
      failed.push(...closeRouter.failed);
    } catch (error) {
-@@ -567,6 +577,23 @@ export async function refreshProviderModels(
+@@ -492,6 +498,19 @@ export async function refreshProviderModels(
      });
    }
  
-+  // ---------------------------------------------------------------------------
-+  // 1.6. OpenRouter (CustomKIMI): limits and efforts of the configured aliases
-+  //      from the public catalog, never the whole catalog (see ./openrouter).
-+  // ---------------------------------------------------------------------------
 +  try {
 +    const openRouter = await refreshOpenRouterModels(host, config, { providerId: targetId });
 +    config = openRouter.config;
@@ -575,9 +560,9 @@ index 924cb4c344429ec31f91f59d1f364ba55924fad2..cc1656de7064d1ca26a42ad39497459c
 +    });
 +  }
 +
-   // ---------------------------------------------------------------------------
-   // 2. Open Platforms (moonshot-cn, moonshot-ai, …)
-   // ---------------------------------------------------------------------------
+   const openPlatformIds = Object.keys(config.providers).filter((id) => {
+     if (!isOpenPlatformId(id)) return false;
+     const provider = readProvider(config, id);
 diff --git a/packages/oauth/test/openrouter.test.ts b/packages/oauth/test/openrouter.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..84be14a25763c47a2c2bc8d218430c24857d4397

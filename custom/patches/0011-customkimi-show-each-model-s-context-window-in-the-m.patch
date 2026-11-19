@@ -1,24 +1,24 @@
-From 1a59aea308ea440a5811202dc86466445e442190 Mon Sep 17 00:00:00 2001
+From b424b152a46e3f7de7210c5ead8f848be270a6e5 Mon Sep 17 00:00:00 2001
 From: Administrator <administrator@Mac.lan>
 Date: Fri, 23 Oct 2026 09:49:05 +0200
-Subject: [PATCH 12/13] customkimi: show each model's context window in the
+Subject: [PATCH 11/15] customkimi: show each model's context window in the
  /model picker
 
 ---
- .../src/tui/components/chrome/footer.ts       |  8 ++--
- .../tui/components/dialogs/model-selector.ts  | 16 +++++++-
- .../kimi-code/src/utils/usage/usage-format.ts | 31 +++++++++++++++
- .../components/dialogs/model-selector.test.ts | 23 ++++++++++-
+ .../src/tui/components/chrome/footer.ts       |  4 +-
+ .../tui/components/dialogs/model-selector.ts  | 15 +++++++-
+ .../kimi-code/src/utils/usage/usage-format.ts | 23 +++++++++++
+ .../components/dialogs/model-selector.test.ts | 21 +++++++++-
  .../components/panels/footer-context.test.ts  | 12 ++++++
  .../test/tui/kimi-tui-message-flow.test.ts    |  4 +-
  .../test/utils/usage/usage-format.test.ts     | 38 +++++++++++++++++++
- 7 files changed, 122 insertions(+), 10 deletions(-)
+ 7 files changed, 110 insertions(+), 7 deletions(-)
 
 diff --git a/apps/kimi-code/src/tui/components/chrome/footer.ts b/apps/kimi-code/src/tui/components/chrome/footer.ts
-index 577c66fd010bd782aa962f169e72601ad524b6fc..1aa8f1fcfd89f32244d15487e04f888a2d1f044a 100644
+index b19bf440e5f1cfee02c43ac480cab41bd740a4ce..b6392ae0acca85f17bc011477e3c945a212df36a 100644
 --- a/apps/kimi-code/src/tui/components/chrome/footer.ts
 +++ b/apps/kimi-code/src/tui/components/chrome/footer.ts
-@@ -36,7 +36,7 @@ import {
+@@ -32,7 +32,7 @@ import {
  } from '#/utils/billing/billing-monitor';
  import { createBillingProviders } from '#/utils/billing/providers';
  import {
@@ -27,15 +27,7 @@ index 577c66fd010bd782aa962f169e72601ad524b6fc..1aa8f1fcfd89f32244d15487e04f888a
    usagePercent,
    usagePercentFromRatio,
  } from '#/utils/usage/usage-format';
-@@ -178,13 +178,13 @@ function shortenCwd(path: string): string {
- /**
-  * Footer context readout. Percent comes from the exact token counts when
-  * both are known (the ratio can lag a step behind); otherwise it falls
-- * back to the precomputed ratio. Counts use the shared 1024-based
-- * formatter.
-+ * back to the precomputed ratio. Counts use the context-size formatter,
-+ * so the window reads as in the /model picker ("1M", "200k", "256k").
-  */
+@@ -162,7 +162,7 @@ function shortenCwd(path: string, home: string | undefined): string {
  function formatContextStatus(usage: number, tokens?: number, maxTokens?: number): string {
    if (maxTokens !== undefined && maxTokens > 0 && tokens !== undefined) {
      const pct = String(usagePercent(tokens, maxTokens));
@@ -45,7 +37,7 @@ index 577c66fd010bd782aa962f169e72601ad524b6fc..1aa8f1fcfd89f32244d15487e04f888a
    return `context: ${String(usagePercentFromRatio(usage))}%`;
  }
 diff --git a/apps/kimi-code/src/tui/components/dialogs/model-selector.ts b/apps/kimi-code/src/tui/components/dialogs/model-selector.ts
-index 2532f14a2d83cc1a1481ade2c148136df0755339..221234d53eab33cd41e07ab285d09bc6590fe0c0 100644
+index 030a7c551cabba4e2177b83c72835885f1f430ad..d54702aee6022432d6fcb29f277cd0d245d9a204 100644
 --- a/apps/kimi-code/src/tui/components/dialogs/model-selector.ts
 +++ b/apps/kimi-code/src/tui/components/dialogs/model-selector.ts
 @@ -13,6 +13,7 @@ import { DEFAULT_OAUTH_PROVIDER_NAME, PRODUCT_NAME } from '#/constant/app';
@@ -56,16 +48,15 @@ index 2532f14a2d83cc1a1481ade2c148136df0755339..221234d53eab33cd41e07ab285d09bc6
  
  import type { ChoiceOption } from './choice-picker';
  
-@@ -25,6 +26,8 @@ interface ModelChoice {
+@@ -23,6 +24,7 @@ interface ModelChoice {
+   readonly model: ModelAlias;
    readonly name: string;
-   /** Provider display name (right column). */
    readonly provider: string;
-+  /** Context window ("1M", "200k"; middle column), empty when unknown. */
 +  readonly context: string;
-   /** Combined text the fuzzy filter matches against (name + provider). */
    readonly label: string;
  }
-@@ -95,7 +98,10 @@ function createModelChoices(models: Record<string, ModelAlias>): readonly ModelC
+ 
+@@ -76,7 +78,10 @@ function createModelChoices(models: Record<string, ModelAlias>): readonly ModelC
      const effective = effectiveModelAlias(cfg);
      const name = modelDisplayName(alias, effective);
      const provider = providerDisplayName(effective.provider);
@@ -77,8 +68,8 @@ index 2532f14a2d83cc1a1481ade2c148136df0755339..221234d53eab33cd41e07ab285d09bc6
    });
  }
  
-@@ -318,9 +324,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
-       // the provider + "← current" marker still fit on normal terminal widths.
+@@ -256,9 +261,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
+     } else {
        const nameCap = Math.max(8, Math.floor(width * 0.5));
        let nameWidth = 0;
 +      let contextWidth = 0;
@@ -91,7 +82,7 @@ index 2532f14a2d83cc1a1481ade2c148136df0755339..221234d53eab33cd41e07ab285d09bc6
        }
        nameWidth = Math.min(nameWidth, nameCap);
  
-@@ -334,6 +343,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
+@@ -272,6 +280,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
          const namePad = ' '.repeat(Math.max(0, nameWidth - visibleWidth(truncatedName)));
          let line = currentTheme.fg(isSelected ? 'primary' : 'textDim', `  ${pointer} `);
          line += (isSelected ? currentTheme.boldFg('primary', truncatedName) : currentTheme.fg('text', truncatedName)) + namePad;
@@ -102,20 +93,13 @@ index 2532f14a2d83cc1a1481ade2c148136df0755339..221234d53eab33cd41e07ab285d09bc6
          if (isCurrent) {
            line += ' ' + currentTheme.fg('success', CURRENT_MARK);
 diff --git a/apps/kimi-code/src/utils/usage/usage-format.ts b/apps/kimi-code/src/utils/usage/usage-format.ts
-index 1d332b302b0ebfa05836710de2aa091f1b559903..1eac8b523e2595977ab22fc7b3de4029fc482a9d 100644
+index 8d9faae9e264413f7f77c2e50bfa5f07f59a8895..6cf8eb580c593a19fc46fc3ecb1bcbcd4065e852 100644
 --- a/apps/kimi-code/src/utils/usage/usage-format.ts
 +++ b/apps/kimi-code/src/utils/usage/usage-format.ts
-@@ -22,6 +22,37 @@ export function formatTokenCount(n: number): string {
+@@ -10,6 +10,29 @@ export function formatTokenCount(n: number): string {
    return String(n);
  }
  
-+/**
-+ * Format a context window, or a token count shown against one, the way
-+ * providers advertise sizes: decimal units when they come out exact
-+ * (1000000 → "1M", 200000 → "200k", 1050000 → "1.05M"), else binary units
-+ * when those do (262144 → "256k", 1048576 → "1M"), else rounded decimal
-+ * units ("944k", "12.3k").
-+ */
 +export function formatContextSize(n: number): string {
 +  if (!Number.isFinite(n) || n < 0) return '0';
 +  if (n < 1000) return String(Math.round(n));
@@ -135,30 +119,27 @@ index 1d332b302b0ebfa05836710de2aa091f1b559903..1eac8b523e2595977ab22fc7b3de4029
 +  return `${k >= 100 ? String(Math.round(k)) : trimDecimals(k, 1)}k`;
 +}
 +
-+/** Up to `digits` decimals with trailing zeros dropped ("1.50" → "1.5", "1.00" → "1"). */
 +function trimDecimals(v: number, digits: number): string {
 +  return v.toFixed(digits).replace(/\.?0+$/, '');
 +}
 +
- /** One decimal place, dropping a redundant ".0" ("1.0" → "1", "1.5" stays). */
  function trimDecimal(v: number): string {
    const s = v.toFixed(1);
+   return s.endsWith('.0') ? s.slice(0, -2) : s;
 diff --git a/apps/kimi-code/test/tui/components/dialogs/model-selector.test.ts b/apps/kimi-code/test/tui/components/dialogs/model-selector.test.ts
-index e5159ec0d927074cfa7bb14b24f9eeeb7017a05f..f552ee82c1e9bde9063e576cdf70a74c35d0c883 100644
+index bbdfdb37e483f6f9e9f74c6f8358f7476ee81798..e8ea28c75cc601aa1f77b96d9a8dac7a8d6b8d13 100644
 --- a/apps/kimi-code/test/tui/components/dialogs/model-selector.test.ts
 +++ b/apps/kimi-code/test/tui/components/dialogs/model-selector.test.ts
-@@ -56,8 +56,8 @@ describe('ModelSelectorComponent', () => {
+@@ -56,7 +56,7 @@ describe('ModelSelectorComponent', () => {
      });
  
      const out = text(picker);
--    // Model name on the left, provider on the right, with the current marker.
 -    expect(out).toMatch(/❯ Kimi K2\s+Kimi Code ← current/);
-+    // Model name on the left, context window, provider on the right, with the current marker.
 +    expect(out).toMatch(/❯ Kimi K2\s+200k\s+Kimi Code ← current/);
-     // Provider is no longer inlined in parentheses next to the name.
      expect(out).not.toContain('Kimi K2 (Kimi Code)');
    });
-@@ -285,6 +285,25 @@ describe('ModelSelectorComponent', () => {
+ 
+@@ -273,6 +273,25 @@ describe('ModelSelectorComponent', () => {
      expect(text(picker)).toContain('▼ 4 more');
    });
  
@@ -185,7 +166,7 @@ index e5159ec0d927074cfa7bb14b24f9eeeb7017a05f..f552ee82c1e9bde9063e576cdf70a74c
      const picker = new ModelSelectorComponent({
        models: {
 diff --git a/apps/kimi-code/test/tui/components/panels/footer-context.test.ts b/apps/kimi-code/test/tui/components/panels/footer-context.test.ts
-index 100f5f6a3bae8ff55b1f1e77918ec2329d491011..c8d57a438e4125a29fae4392b2dbc447b3d0bb90 100644
+index 198e3420b4ff1358da76775d15e7584fda4858fe..38172f771ac3cd4fa1121f8dca1668cacf3ee63a 100644
 --- a/apps/kimi-code/test/tui/components/panels/footer-context.test.ts
 +++ b/apps/kimi-code/test/tui/components/panels/footer-context.test.ts
 @@ -90,6 +90,18 @@ describe('FooterComponent — context NaN resilience', () => {
@@ -208,10 +189,10 @@ index 100f5f6a3bae8ff55b1f1e77918ec2329d491011..c8d57a438e4125a29fae4392b2dbc447
      const fc = new FooterComponent(
        baseState({ contextUsage: 0, contextTokens: 500, maxContextTokens: 0 }),
 diff --git a/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts b/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts
-index c7cb6506bca3275ccb7249ad131315a116da1955..e58869a4ce6b06861f4f2af8622ced8aad4590b8 100644
+index 1db343a67a084d594d3adc56bbf8fd5de8065436..f51193da0a3a526b29e92c446d4084938a5412d2 100644
 --- a/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts
 +++ b/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts
-@@ -10444,8 +10444,8 @@ capabilities = ["image_in", "video_in"]
+@@ -13369,8 +13369,8 @@ capabilities = ["image_in", "video_in"]
      });
      const picker = driver.state.editorContainer.children[0];
      const pickerOutput = stripSgr((picker as TabbedModelSelectorComponent).render(120).join('\n'));

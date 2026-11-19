@@ -1,7 +1,7 @@
-From 641bb5a850f896f861f1d114c206d6a9cd1fd9dc Mon Sep 17 00:00:00 2001
+From 5aeacae3ca51f001d5ca284b13bd7d5eed945d51 Mon Sep 17 00:00:00 2001
 From: CustomKIMI <customkimi@localhost>
 Date: Tue, 27 Oct 2026 21:29:57 +0700
-Subject: [PATCH 14/14] customkimi: show the muse subscription's usage in
+Subject: [PATCH 13/15] customkimi: show the muse subscription's usage in
  /usage and the web UI
 
 Adds a "Muse" section to the existing /usage command (shown whenever a
@@ -291,20 +291,20 @@ index ff0897f1c051da698153a20eb663585c1738909f..10c9b747c25de8689fb88d840aed621a
 +  });
 +}
 diff --git a/apps/kimi-code/src/cli/sub/web/run.ts b/apps/kimi-code/src/cli/sub/web/run.ts
-index fca3f9b8fb72e130faf1f6a5ca766bfb1f173b8e..55ed50c6d0b825febce3869905ab9f88e35283d4 100644
+index 2747c7e5509d49d665bfc7defc6af103b9d5c379..265e29448301209b40a4d1e88555a861ad2455a2 100644
 --- a/apps/kimi-code/src/cli/sub/web/run.ts
 +++ b/apps/kimi-code/src/cli/sub/web/run.ts
-@@ -27,7 +27,7 @@ import { BillingMonitor } from '#/utils/billing/billing-monitor';
- import { createBillingProviders } from '#/utils/billing/providers';
- 
- import { initializeServerTelemetry } from '../../telemetry';
+@@ -33,7 +33,7 @@ import {
+   isLoopbackHost,
+   splitTokenFragment,
+ } from './access-urls';
 -import { BALANCE_BADGE_HTML, registerBalanceBadge } from './balance-badge';
 +import { BALANCE_BADGE_HTML, registerBalanceBadge, registerMuseUsageRoute } from './balance-badge';
+ import { type NetworkAddress } from './networks';
  import {
-   createKimiCodeHostIdentity,
-   getHostPackageRoot,
-@@ -408,10 +408,12 @@ async function runServerInProcess(
-     // only covers host-level events.
+   formatRemoteControlOutput,
+@@ -431,10 +431,12 @@ async function runServerInProcess(
+     managedBy: options.managedBy,
      telemetry: true,
      webAssetsDir,
 -    // CustomKIMI: the provider balance badge next to the web UI's model picker.
@@ -318,7 +318,7 @@ index fca3f9b8fb72e130faf1f6a5ca766bfb1f173b8e..55ed50c6d0b825febce3869905ab9f88
    });
    logger.info('serving the REST/WS API and the bundled web UI');
 diff --git a/apps/kimi-code/src/tui/commands/info.ts b/apps/kimi-code/src/tui/commands/info.ts
-index f8bdc0635963e30a50a08764f7224fafe256ff1c..8122b046678395ef515070cc6ded8cdc20aaca88 100644
+index 4b9795a2f39838df76f6ba3bbe5ca3d014db1f99..2a58876dac38d08a5ce465e70eb0b416d88b1ead 100644
 --- a/apps/kimi-code/src/tui/commands/info.ts
 +++ b/apps/kimi-code/src/tui/commands/info.ts
 @@ -4,8 +4,14 @@ import type { McpServerInfo, SessionStatus, SessionUsage } from '@moonshot-ai/ki
@@ -337,7 +337,7 @@ index f8bdc0635963e30a50a08764f7224fafe256ff1c..8122b046678395ef515070cc6ded8cdc
  import { quotaUsageRows } from '#/utils/usage/usage-format';
  import {
    FEEDBACK_ISSUE_URL,
-@@ -146,9 +152,19 @@ interface ManagedUsageResult {
+@@ -144,9 +150,19 @@ interface ManagedUsageResult {
    readonly error?: string;
  }
  
@@ -358,7 +358,7 @@ index f8bdc0635963e30a50a08764f7224fafe256ff1c..8122b046678395ef515070cc6ded8cdc
    const reportArgs = {
      sessionUsage: sessionUsage.usage,
      sessionUsageError: sessionUsage.error,
-@@ -160,6 +176,12 @@ export async function showUsage(host: SlashCommandHost): Promise<void> {
+@@ -158,6 +174,12 @@ export async function showUsage(host: SlashCommandHost): Promise<void> {
    };
    const panel = new UsagePanelComponent(() => buildUsageReportLines(reportArgs), 'primary');
    host.state.transcriptContainer.addChild(panel);
@@ -371,7 +371,7 @@ index f8bdc0635963e30a50a08764f7224fafe256ff1c..8122b046678395ef515070cc6ded8cdc
    host.state.ui.requestRender();
  }
  
-@@ -253,3 +275,16 @@ async function loadManagedUsageReport(host: SlashCommandHost): Promise<ManagedUs
+@@ -249,3 +271,16 @@ async function loadManagedUsageReport(host: SlashCommandHost): Promise<ManagedUs
    }
    return { usage: { rows: quotaUsageRows(res.quota), extraUsage: res.quota.extraUsage } };
  }
@@ -389,10 +389,10 @@ index f8bdc0635963e30a50a08764f7224fafe256ff1c..8122b046678395ef515070cc6ded8cdc
 +  return usage === undefined ? { error: MUSE_USAGE_UNAVAILABLE } : { usage };
 +}
 diff --git a/apps/kimi-code/src/tui/components/messages/usage-panel.ts b/apps/kimi-code/src/tui/components/messages/usage-panel.ts
-index 1b615ac569e52301321a1b941b756e7cb9d91349..46d49b8e588b8f9bb1f52aa29661f75c61ca467d 100644
+index a16c6433a3cd134d4076fda66ba3a839b34504af..1b0ef7beab741a16f36e5e8ca627bedf109676c7 100644
 --- a/apps/kimi-code/src/tui/components/messages/usage-panel.ts
 +++ b/apps/kimi-code/src/tui/components/messages/usage-panel.ts
-@@ -17,6 +17,7 @@ import {
+@@ -11,6 +11,7 @@ import {
    usagePercent,
    type QuotaUsageRow,
  } from '#/utils/usage/usage-format';
@@ -400,7 +400,7 @@ index 1b615ac569e52301321a1b941b756e7cb9d91349..46d49b8e588b8f9bb1f52aa29661f75c
  import { currentTheme } from '#/tui/theme';
  import type { ColorToken } from '#/tui/theme';
  
-@@ -65,6 +66,11 @@ export interface ManagedUsageReportLineOptions {
+@@ -59,6 +60,11 @@ export interface ManagedUsageReportLineOptions {
    readonly managedUsageError?: string;
  }
  
@@ -412,7 +412,7 @@ index 1b615ac569e52301321a1b941b756e7cb9d91349..46d49b8e588b8f9bb1f52aa29661f75c
  function usageNumber(value: unknown): number {
    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
  }
-@@ -120,12 +126,13 @@ function buildManagedUsageSection(
+@@ -114,12 +120,13 @@ function buildManagedUsageSection(
    value: Colorize,
    muted: Colorize,
    errorStyle: Colorize,
@@ -428,7 +428,7 @@ index 1b615ac569e52301321a1b941b756e7cb9d91349..46d49b8e588b8f9bb1f52aa29661f75c
    }
  
    const labels = rows.map((r) => r.name);
-@@ -133,7 +140,7 @@ function buildManagedUsageSection(
+@@ -127,7 +134,7 @@ function buildManagedUsageSection(
    const rowRatio = (r: QuotaUsageRow): number => safeUsageRatio(r.usedRatio);
    const pctWidth = Math.max(...rows.map((r) => `${Math.round(rowRatio(r) * 100)}% used`.length));
  
@@ -437,7 +437,7 @@ index 1b615ac569e52301321a1b941b756e7cb9d91349..46d49b8e588b8f9bb1f52aa29661f75c
    for (let i = 0; i < rows.length; i++) {
      const row = rows[i]!;
      const ratioUsed = rowRatio(row);
-@@ -255,6 +262,39 @@ export function buildManagedUsageReportLines(options: ManagedUsageReportLineOpti
+@@ -243,6 +250,39 @@ export function buildManagedUsageReportLines(options: ManagedUsageReportLineOpti
    );
  }
  
@@ -817,7 +817,7 @@ index a15ddc2b473c5c43247da33cf7ff6a106440195c..d09c1cb7babfee04af34bb671f2070e1
 +  });
 +});
 diff --git a/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts b/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
-index d46b78e061469503b27ebeaef7703e253a255d18..8122f8a8790aa5b8faa4f96a9770ad5031e7b61f 100644
+index 6230f3d3d37f310d3e0c307cdf5a5748f8f007aa..14190612c10cf10f0b81228fffeedf23a3c34383 100644
 --- a/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
 +++ b/apps/kimi-code/test/tui/components/messages/usage-panel.test.ts
 @@ -1,7 +1,11 @@
@@ -833,7 +833,7 @@ index d46b78e061469503b27ebeaef7703e253a255d18..8122f8a8790aa5b8faa4f96a9770ad50
  import { currentTheme, darkColors, lightColors } from '#/tui/theme';
  
  afterEach(() => {
-@@ -244,6 +248,7 @@ describe('UsagePanelComponent', () => {
+@@ -238,6 +242,7 @@ describe('UsagePanelComponent', () => {
          appState: {
            model: 'kimi',
            availableModels: {},
@@ -841,7 +841,7 @@ index d46b78e061469503b27ebeaef7703e253a255d18..8122f8a8790aa5b8faa4f96a9770ad50
            contextUsage: 0,
            contextTokens: 0,
            maxContextTokens: 1_000_000,
-@@ -310,3 +315,126 @@ describe('UsagePanelComponent', () => {
+@@ -302,3 +307,126 @@ describe('UsagePanelComponent', () => {
      expect(bodyOf()).toContain(lightColors.text);
    });
  });

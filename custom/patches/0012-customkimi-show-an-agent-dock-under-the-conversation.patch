@@ -1,24 +1,25 @@
-From 3a1fd3f41a5fe9943742c419951915ec934e16fe Mon Sep 17 00:00:00 2001
+From 2993b27a4a7e9f60c8c57d7a037eda614e653969 Mon Sep 17 00:00:00 2001
 From: CustomKIMI <customkimi@localhost>
 Date: Sat, 17 Oct 2026 01:09:40 +0200
-Subject: [PATCH 13/13] customkimi: show an agent dock under the conversation
+Subject: [PATCH 12/15] customkimi: show an agent dock under the conversation
 
 ---
  .changeset/agent-dock.md                      |   5 +
  .../src/tui/components/chrome/agent-dock.ts   | 364 ++++++++++++++++++
- .../dialogs/agent-activity-viewer.ts          |  61 +--
+ .../dialogs/agent-activity-viewer.ts          |  55 +--
  .../components/messages/agent-conversation.ts | 116 ++++++
  .../messages/subagent-activity-lines.ts       |  78 ++++
- .../tui/controllers/agent-dock-controller.ts  | 216 +++++++++++
+ .../tui/controllers/agent-dock-controller.ts  | 219 +++++++++++
  .../src/tui/controllers/editor-keyboard.ts    |   5 +-
  .../controllers/subagent-activity-store.ts    |  34 +-
  .../tui/controllers/subagent-event-handler.ts |   5 +
  apps/kimi-code/src/tui/kimi-tui.ts            |   7 +
- apps/kimi-code/src/tui/tui-state.ts           |   5 +
+ apps/kimi-code/src/tui/tui-state.ts           |   4 +
  .../tui/components/chrome/agent-dock.test.ts  | 214 ++++++++++
  .../messages/agent-conversation.test.ts       |  76 ++++
  .../subagent-activity-store.test.ts           |  28 ++
- 14 files changed, 1157 insertions(+), 57 deletions(-)
+ .../test/tui/kimi-tui-startup.test.ts         |   2 +-
+ 15 files changed, 1160 insertions(+), 52 deletions(-)
  create mode 100644 .changeset/agent-dock.md
  create mode 100644 apps/kimi-code/src/tui/components/chrome/agent-dock.ts
  create mode 100644 apps/kimi-code/src/tui/components/messages/agent-conversation.ts
@@ -40,7 +41,7 @@ index 0000000000000000000000000000000000000000..9c2c6e99848ff9a91c101d0316921d74
 +Show every running subagent as a row under the conversation; `↓` selects a row, `Enter` opens that agent's conversation live, and finished agents turn green before leaving the list.
 diff --git a/apps/kimi-code/src/tui/components/chrome/agent-dock.ts b/apps/kimi-code/src/tui/components/chrome/agent-dock.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..9801b9a3519806f0de75d0d1f7b2a13061f616e8
+index 0000000000000000000000000000000000000000..3f32104a6869e65e86ce9b5c23e45ab6702b6758
 --- /dev/null
 +++ b/apps/kimi-code/src/tui/components/chrome/agent-dock.ts
 @@ -0,0 +1,364 @@
@@ -134,7 +135,7 @@ index 0000000000000000000000000000000000000000..9801b9a3519806f0de75d0d1f7b2a130
 +}
 +
 +function rowStatusOf(record: SubagentActivityRecord): AgentDockRowStatus {
-+  return record.status;
++  return record.status === 'cancelled' ? 'ended' : record.status;
 +}
 +
 +export class AgentDockComponent implements Component, Focusable {
@@ -409,10 +410,10 @@ index 0000000000000000000000000000000000000000..9801b9a3519806f0de75d0d1f7b2a130
 +  }
 +}
 diff --git a/apps/kimi-code/src/tui/components/dialogs/agent-activity-viewer.ts b/apps/kimi-code/src/tui/components/dialogs/agent-activity-viewer.ts
-index 6a58d9ffd5b80cdfcf94560c4c8e031e33e36672..fae442208392dccc8b4f34ab5c06f6d44156547c 100644
+index 89b4c3472af371fccd42db0121ab19604995c5b3..241abacbb83d55374e90b0884b69ae0f57b8949e 100644
 --- a/apps/kimi-code/src/tui/components/dialogs/agent-activity-viewer.ts
 +++ b/apps/kimi-code/src/tui/components/dialogs/agent-activity-viewer.ts
-@@ -26,7 +26,6 @@ import {
+@@ -10,7 +10,6 @@ import {
  import type { BackgroundTaskInfo } from '@moonshot-ai/kimi-code-sdk';
  
  import { MESSAGE_INDENT } from '#/tui/constant/rendering';
@@ -420,7 +421,7 @@ index 6a58d9ffd5b80cdfcf94560c4c8e031e33e36672..fae442208392dccc8b4f34ab5c06f6d4
  import type {
    SubagentActivityRecord,
    SubToolCallActivity,
-@@ -35,9 +34,12 @@ import { currentTheme } from '#/tui/theme';
+@@ -19,10 +18,13 @@ import { currentTheme } from '#/tui/theme';
  import type { ToolCallBlockData } from '#/tui/types';
  import { printableChar } from '#/tui/utils/printable-key';
  import { AssistantMessageComponent } from '../messages/assistant-message';
@@ -428,20 +429,16 @@ index 6a58d9ffd5b80cdfcf94560c4c8e031e33e36672..fae442208392dccc8b4f34ab5c06f6d4
 +  buildSubagentToolCallHeader,
 +  renderSubagentToolCallBody,
 +} from '../messages/subagent-activity-lines';
+ import { ThinkingComponent } from '../messages/thinking';
  import { extractKeyArgument } from '../messages/tool-call';
  import { pickChip } from '../messages/tool-renderers/chip';
 -import { pickResultRenderer } from '../messages/tool-renderers/registry';
  import { STATUS_LABEL, statusColor } from './task-output-viewer';
  
  const ELLIPSIS = '…';
-@@ -218,63 +220,12 @@ export class AgentActivityViewer extends Container implements Focusable {
-     return out;
+@@ -201,56 +203,11 @@ export class AgentActivityViewer extends Container implements Focusable {
    }
  
--  /** Same shape as the main flow's generic header (`tool-call.ts`
--   *  `buildHeader`): bullet + verb + name + key argument + chip. Custom
--   *  per-tool label wording (e.g. "Ran a command") is intentionally not
--   *  mirrored — the per-tool *body* renderers carry the specialization. */
    private buildToolCallHeader(call: SubToolCallActivity): string {
 -    let bullet: string;
 -    if (call.status === 'error') {
@@ -477,8 +474,6 @@ index 6a58d9ffd5b80cdfcf94560c4c8e031e33e36672..fae442208392dccc8b4f34ab5c06f6d4
 -        ? []
 -        : [currentTheme.dim(`${MESSAGE_INDENT}│ ${call.liveOutputTail}`)];
 -    }
--    // The store caps retained output, which cannot survive as a parseable
--    // media envelope (base64) — show a marker instead of dumping the blob.
 -    if (call.name === 'ReadMediaFile' && call.result.is_error !== true) {
 -      return [currentTheme.dim(`${MESSAGE_INDENT}[media output omitted]`)];
 -    }
@@ -499,7 +494,7 @@ index 6a58d9ffd5b80cdfcf94560c4c8e031e33e36672..fae442208392dccc8b4f34ab5c06f6d4
 +    return renderSubagentToolCallBody(call, innerWidth, this.expanded);
    }
  
-   // ── render ─────────────────────────────────────────────────────────
+   override render(width: number): string[] {
 diff --git a/apps/kimi-code/src/tui/components/messages/agent-conversation.ts b/apps/kimi-code/src/tui/components/messages/agent-conversation.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..0e92a72faad9ba5ee79496d1e4730e2bc6291e32
@@ -708,10 +703,10 @@ index 0000000000000000000000000000000000000000..15b5b026d6f6468943ef7adb5324e89d
 +}
 diff --git a/apps/kimi-code/src/tui/controllers/agent-dock-controller.ts b/apps/kimi-code/src/tui/controllers/agent-dock-controller.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..1b8daad83b08305ca2e7da13206aa179e99319bf
+index 0000000000000000000000000000000000000000..bd9a17f303f926484c7c5871c91533f04e0886ed
 --- /dev/null
 +++ b/apps/kimi-code/src/tui/controllers/agent-dock-controller.ts
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,219 @@
 +/**
 + * AgentDockController — wires the agent dock under the conversation to the
 + * subagent activity store and shows an agent's conversation on Enter.
@@ -731,6 +726,7 @@ index 0000000000000000000000000000000000000000..1b8daad83b08305ca2e7da13206aa179
 +import { AgentDockComponent, type AgentDockRow } from '#/tui/components/chrome/agent-dock';
 +import { GutterContainer } from '#/tui/components/chrome/gutter-container';
 +import { AgentConversationComponent } from '#/tui/components/messages/agent-conversation';
++import { TranscriptContainer } from '#/tui/components/messages/transcript-container';
 +import { TranscriptView } from '#/tui/components/messages/transcript-view';
 +import { CHROME_GUTTER } from '#/tui/constant/rendering';
 +import type { SessionEventHandler } from '#/tui/controllers/session-event-handler';
@@ -839,7 +835,7 @@ index 0000000000000000000000000000000000000000..1b8daad83b08305ca2e7da13206aa179
 +    if (this.open?.row === row) return;
 +    const { state } = this.host;
 +    const component = new AgentConversationComponent(row.record, {
-+      expanded: () => state.toolOutputExpanded,
++      expanded: () => state.transcriptContainer.toolOutputExpanded,
 +      tick: () => this.dock.animationTick(),
 +    });
 +    if (this.open !== undefined) {
@@ -888,18 +884,20 @@ index 0000000000000000000000000000000000000000..1b8daad83b08305ca2e7da13206aa179
 +
 +  private mount(component: AgentConversationComponent, swap: TranscriptSwap): void {
 +    const { state } = this.host;
-+    const container = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
-+    container.addChild(component);
 +    if (swap.kind === 'root') {
 +      const ui = state.ui as TuiAltScreen;
++      const transcript = new TranscriptContainer(CHROME_GUTTER, CHROME_GUTTER, ui);
++      transcript.addChild(component);
 +      const root = new VStack();
-+      root.addChild(new TranscriptView(container), { basis: 0, grow: 1, shrink: 1, minSize: 1 });
++      root.addChild(new TranscriptView(transcript), { basis: 0, grow: 1, shrink: 1, minSize: 1 });
 +      if (state.dockContainer !== undefined) {
 +        root.addChild(state.dockContainer, { basis: 'auto', grow: 0, shrink: 1, minSize: 1 });
 +      }
 +      ui.setLayoutRoot(root);
 +      return;
 +    }
++    const container = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
++    container.addChild(component);
 +    state.ui.children[swap.index] = container;
 +  }
 +
@@ -929,10 +927,10 @@ index 0000000000000000000000000000000000000000..1b8daad83b08305ca2e7da13206aa179
 +  }
 +}
 diff --git a/apps/kimi-code/src/tui/controllers/editor-keyboard.ts b/apps/kimi-code/src/tui/controllers/editor-keyboard.ts
-index 5fd7905479e4ec0545b9a441fd9914632f5fbd34..e10606230aa315f9e09c3a54b2b54dc19715289e 100644
+index 9f29b05d318e6b1e5dd627129ce02e44f86af8e1..86a562a7f959a376e831753f524617765c41c9f4 100644
 --- a/apps/kimi-code/src/tui/controllers/editor-keyboard.ts
 +++ b/apps/kimi-code/src/tui/controllers/editor-keyboard.ts
-@@ -30,6 +30,7 @@ import { extractMediaAttachments, imageExtensionForMime } from '../utils/image-p
+@@ -32,6 +32,7 @@ import { extractMediaAttachments, imageExtensionForMime } from '../utils/image-p
  import { resolveUserInput } from '../commands/resolve';
  import type { PendingExit, QueuedMessage } from '../types';
  import type { TUIState } from '../tui-state';
@@ -940,15 +938,15 @@ index 5fd7905479e4ec0545b9a441fd9914632f5fbd34..e10606230aa315f9e09c3a54b2b54dc1
  import type { BtwPanelController } from './btw-panel';
  import type { SurveyController } from './survey-controller';
  import type { ModelMigrationController } from './model-migration';
-@@ -46,6 +47,7 @@ export interface EditorKeyboardHost {
+@@ -43,6 +44,7 @@ export interface EditorKeyboardHost {
    harness?: KimiHarness | undefined;
  
-   handleUserInput(text: string): void;
+   handleUserInput(text: string, delivery?: FollowUpDelivery): void;
 +  readonly agentDockController: AgentDockController;
    readonly btwPanelController: BtwPanelController;
    readonly surveyController: SurveyController;
    readonly modelMigration?: ModelMigrationController;
-@@ -422,7 +424,8 @@ export class EditorKeyboardController {
+@@ -403,7 +405,8 @@ export class EditorKeyboardController {
        return false;
      };
  
@@ -959,10 +957,10 @@ index 5fd7905479e4ec0545b9a441fd9914632f5fbd34..e10606230aa315f9e09c3a54b2b54dc1
      editor.onPasteImage = async () => this.handleClipboardImagePaste();
    }
 diff --git a/apps/kimi-code/src/tui/controllers/subagent-activity-store.ts b/apps/kimi-code/src/tui/controllers/subagent-activity-store.ts
-index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d8c23390d 100644
+index fcaeebdfd868ceb55d2eac014e491ae25557a1fa..e69d4a95ca554da5528b47199d547445752061a7 100644
 --- a/apps/kimi-code/src/tui/controllers/subagent-activity-store.ts
 +++ b/apps/kimi-code/src/tui/controllers/subagent-activity-store.ts
-@@ -61,6 +61,8 @@ export interface SubagentActivityRecord {
+@@ -37,6 +37,8 @@ export interface SubagentActivityRecord {
    readonly agentId: string;
    readonly agentName: string;
    readonly description?: string;
@@ -971,7 +969,7 @@ index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d
    readonly parentToolCallId: string;
    model?: string;
    effort?: string;
-@@ -78,6 +80,7 @@ export interface SubagentActivitySpawn {
+@@ -52,6 +54,7 @@ export interface SubagentActivitySpawn {
    readonly agentId: string;
    readonly agentName: string;
    readonly description?: string;
@@ -979,7 +977,7 @@ index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d
    readonly parentToolCallId: string;
    readonly model?: string;
    readonly effort?: string;
-@@ -105,10 +108,32 @@ function capArgStrings(args: Record<string, unknown>): Record<string, unknown> {
+@@ -73,10 +76,32 @@ function capArgStrings(args: Record<string, unknown>): Record<string, unknown> {
    return capped ?? args;
  }
  
@@ -994,7 +992,7 @@ index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d
 +
  export class SubagentActivityStore {
    private readonly records = new Map<string, SubagentActivityRecord>();
-   /** Raw streaming-arguments buffer per in-flight tool call (from deltas). */
+   private readonly startedSteps = new Set<string>();
    private readonly streamingArgs = new Map<string, string>();
 +  private readonly listeners = new Set<SubagentActivityListener>();
 +
@@ -1012,7 +1010,7 @@ index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d
  
    ensureRecord(spawn: SubagentActivitySpawn): SubagentActivityRecord {
      const existing = this.records.get(spawn.agentId);
-@@ -118,12 +143,15 @@ export class SubagentActivityStore {
+@@ -84,6 +109,8 @@ export class SubagentActivityStore {
        existing.status = 'running';
        existing.resultSummary = undefined;
        existing.error = undefined;
@@ -1020,7 +1018,8 @@ index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d
 +      this.bump(existing);
        return existing;
      }
-     const record: SubagentActivityRecord = {
+     const earlyActivity = existing?.parentToolCallId === '' ? existing : undefined;
+@@ -94,6 +121,7 @@ export class SubagentActivityStore {
        agentId: spawn.agentId,
        agentName: spawn.agentName,
        description: spawn.description,
@@ -1028,7 +1027,7 @@ index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d
        parentToolCallId: spawn.parentToolCallId,
        model: spawn.model,
        effort: spawn.effort,
-@@ -133,6 +161,7 @@ export class SubagentActivityStore {
+@@ -103,6 +131,7 @@ export class SubagentActivityStore {
        version: 0,
      };
      this.records.set(spawn.agentId, record);
@@ -1036,17 +1035,13 @@ index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d
      return record;
    }
  
-@@ -286,6 +315,7 @@ export class SubagentActivityStore {
-   clear(): void {
+@@ -269,11 +298,13 @@ export class SubagentActivityStore {
      this.records.clear();
+     this.startedSteps.clear();
      this.streamingArgs.clear();
 +    this.emit({ kind: 'clear' });
    }
  
-   /** Drop one agent's record and its in-flight arg buffers. Used when a
-@@ -293,8 +323,9 @@ export class SubagentActivityStore {
-    *  /tasks) reaches a terminal state — its record would otherwise stay
-    *  resident until the session reset. */
    drop(agentId: string): void {
 -    this.records.delete(agentId);
 +    const existed = this.records.delete(agentId);
@@ -1054,8 +1049,8 @@ index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d
 +    if (existed) this.emit({ kind: 'drop', agentId });
    }
  
-   /** No more deltas arrive once the record is terminal, so any buffer left
-@@ -344,5 +375,6 @@ export class SubagentActivityStore {
+   private dropStreamingBuffers(agentId: string): void {
+@@ -316,5 +347,6 @@ export class SubagentActivityStore {
  
    private bump(record: SubagentActivityRecord): void {
      record.version += 1;
@@ -1063,10 +1058,10 @@ index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d
    }
  }
 diff --git a/apps/kimi-code/src/tui/controllers/subagent-event-handler.ts b/apps/kimi-code/src/tui/controllers/subagent-event-handler.ts
-index 93da7ab0b87697b8959bd7acc927a5e26abd0759..123c8a572b5ddca9d8a280f0db8996e2667dcf0b 100644
+index df2a81411276c114d9aa20de110cf128ae331647..edafccd06807fa104d199ca36e54f67cc3947af6 100644
 --- a/apps/kimi-code/src/tui/controllers/subagent-event-handler.ts
 +++ b/apps/kimi-code/src/tui/controllers/subagent-event-handler.ts
-@@ -495,10 +495,15 @@ export class SubAgentEventHandler {
+@@ -506,10 +506,15 @@ export class SubAgentEventHandler {
        runInBackground: event.runInBackground,
        swarmIndex: event.swarmIndex,
      });
@@ -1083,10 +1078,10 @@ index 93da7ab0b87697b8959bd7acc927a5e26abd0759..123c8a572b5ddca9d8a280f0db8996e2
        model: this.spawnedModelDisplay(event),
        effort: this.subagentEffortDisplay(event.thinkingEffort),
 diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
-index 9237e88eae53bdeda07c8d9c94bc697f2aa118e2..cf85eeb301eb4f6d49c852490c693bb363549542 100644
+index ca4bd1b6b1c39d7d15ed4d87c8dd599afd100591..8dad152842051db6ccd153d3a51aac8d68412ff9 100644
 --- a/apps/kimi-code/src/tui/kimi-tui.ts
 +++ b/apps/kimi-code/src/tui/kimi-tui.ts
-@@ -141,6 +141,7 @@ import { SessionReplayRenderer } from './controllers/session-replay';
+@@ -156,6 +156,7 @@ import { SessionReplayRenderer } from './controllers/session-replay';
  import { StagingLeaseTracker, type StagingLease } from './controllers/staging-leases';
  import { StreamingUIController } from './controllers/streaming-ui';
  import { SurveyController } from './controllers/survey-controller';
@@ -1094,7 +1089,7 @@ index 9237e88eae53bdeda07c8d9c94bc697f2aa118e2..cf85eeb301eb4f6d49c852490c693bb3
  import { TasksBrowserController } from './controllers/tasks-browser';
  import { installRainbowDance } from './easter-eggs/dance';
  import { adaptPanelResponse } from './reverse-rpc/approval/adapter';
-@@ -403,6 +404,7 @@ export class KimiTUI {
+@@ -442,6 +443,7 @@ export class KimiTUI {
    readonly sessionEventHandler: SessionEventHandler;
    readonly sessionReplay: SessionReplayRenderer;
    readonly tasksBrowserController: TasksBrowserController;
@@ -1102,7 +1097,7 @@ index 9237e88eae53bdeda07c8d9c94bc697f2aa118e2..cf85eeb301eb4f6d49c852490c693bb3
    readonly surveyController: SurveyController;
    readonly editorKeyboard: EditorKeyboardController;
    readonly modelMigration: ModelMigrationController;
-@@ -520,6 +522,7 @@ export class KimiTUI {
+@@ -577,6 +579,7 @@ export class KimiTUI {
      this.btwPanelController = new BtwPanelController(this, this.imageStore, this.staging);
      this.sessionEventHandler = new SessionEventHandler(this);
      this.sessionReplay = new SessionReplayRenderer(this);
@@ -1110,31 +1105,31 @@ index 9237e88eae53bdeda07c8d9c94bc697f2aa118e2..cf85eeb301eb4f6d49c852490c693bb3
      this.tasksBrowserController = new TasksBrowserController(this);
      this.surveyController = new SurveyController(this, {
        accessToken: () => this.harness.auth.getCachedAccessToken(),
-@@ -1134,6 +1137,7 @@ export class KimiTUI {
-     // before tearing the UI down, so they can't keep firing requestRender after
-     // stop() returns (or leak when stop() runs without process.exit).
+@@ -1301,6 +1304,7 @@ export class KimiTUI {
+     }
+     this.streamingUI.discardPending();
      this.tasksBrowserController.close();
 +    this.agentDockController.dispose();
      this.btwPanelController.clear();
      this.stopActivitySpinner();
-     this.streamingUI.disposeActiveCompactionBlock();
-@@ -1283,6 +1287,7 @@ export class KimiTUI {
+     this.streamingUI.clearActiveCompaction();
+@@ -1428,6 +1432,7 @@ export class KimiTUI {
      ui.clear();
      ui.addChild(this.state.transcriptContainer);
      ui.addChild(this.state.activityContainer);
 +    ui.addChild(this.state.agentDockContainer);
-     ui.addChild(this.state.todoPanelContainer);
      ui.addChild(this.state.notifyPanelContainer);
      ui.addChild(this.state.queueContainer);
-@@ -1324,6 +1329,7 @@ export class KimiTUI {
+     ui.addChild(this.state.btwPanelContainer);
+@@ -1445,6 +1450,7 @@ export class KimiTUI {
      const main = new TuiMainScreen(ui.terminal);
      main.addChild(this.state.transcriptContainer);
      main.addChild(this.state.activityContainer);
 +    main.addChild(this.state.agentDockContainer);
-     main.addChild(this.state.todoPanelContainer);
      main.addChild(this.state.notifyPanelContainer);
      main.addChild(this.state.queueContainer);
-@@ -3165,6 +3171,7 @@ export class KimiTUI {
+     main.addChild(this.state.btwPanelContainer);
+@@ -3538,6 +3544,7 @@ export class KimiTUI {
      this.streamingUI.resetToolCallState();
      this.streamingUI.resetToolUi();
      this.sessionEventHandler.resetRuntimeState();
@@ -1143,42 +1138,41 @@ index 9237e88eae53bdeda07c8d9c94bc697f2aa118e2..cf85eeb301eb4f6d49c852490c693bb3
      this.btwPanelController.clear();
      this.state.footer.setBackgroundCounts({ bashTasks: 0, agentTasks: 0 });
 diff --git a/apps/kimi-code/src/tui/tui-state.ts b/apps/kimi-code/src/tui/tui-state.ts
-index 601079f928a5c25272c815abebd572f7e5c1e608..bb618b5f02ea0fb7f06130059dbe7434e2fe6e16 100644
+index d2006ddfe775e366f197ea5e698f73e2320168b9..073f650b5d8f771bf81abdfed5120509dd286659 100644
 --- a/apps/kimi-code/src/tui/tui-state.ts
 +++ b/apps/kimi-code/src/tui/tui-state.ts
-@@ -44,6 +44,8 @@ export interface TUIState {
-   terminal: ProcessTerminal;
-   transcriptContainer: GutterContainer;
+@@ -51,6 +51,7 @@ export interface TUIState {
+   transcriptContainer: TranscriptContainer;
+   transcriptView?: TranscriptView;
    activityContainer: Container;
-+  /** Agent rows under the conversation (AgentDockComponent). */
 +  agentDockContainer: Container;
-   todoPanelContainer: Container;
-   todoPanel: TodoPanelComponent;
    notifyPanelContainer: Container;
-@@ -136,6 +138,7 @@ export function createTUIState(options: KimiTUIOptions): TUIState {
+   notifyPanel: NotifyPanelComponent;
+   queueContainer: Container;
+@@ -136,6 +137,7 @@ export function createTUIState(options: KimiTUIOptions): TUIState {
  
-   const transcriptContainer = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
+   const transcriptContainer = new TranscriptContainer(CHROME_GUTTER, CHROME_GUTTER, ui);
    const activityContainer = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
 +  const agentDockContainer = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
-   const todoPanelContainer = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
-   const todoPanel = new TodoPanelComponent();
-   const notifyPanelContainer = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
-@@ -163,6 +166,7 @@ export function createTUIState(options: KimiTUIOptions): TUIState {
-     const transcriptView = new TranscriptView(transcriptContainer);
+   const queueContainer = fullscreen ? new VStack() : new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
+   const queuePane = new QueuePaneComponent(fullscreen ? { maxBodyRows: DOCK_QUEUE_ROWS } : undefined);
+   const notifyPanelContainer = fullscreen ? new VStack() : new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
+@@ -164,6 +166,7 @@ export function createTUIState(options: KimiTUIOptions): TUIState {
+     transcriptView = fullscreenView;
      dockContainer = new VStack();
      dockContainer.addChild(activityContainer, { shrink: 1, minSize: 0 });
 +    dockContainer.addChild(agentDockContainer, { shrink: 1, minSize: 0 });
-     dockContainer.addChild(todoPanelContainer, { shrink: 1, minSize: 0 });
      dockContainer.addChild(notifyPanelContainer, { shrink: 1, minSize: 0 });
-     dockContainer.addChild(queueContainer, { shrink: 1, minSize: 0 });
-@@ -183,6 +187,7 @@ export function createTUIState(options: KimiTUIOptions): TUIState {
-     terminal,
+     const unlessBlocked = (): boolean => !isBlockingPromptPending(state);
+     dockContainer.addChild(queueContainer, { shrink: 1, minSize: 0, visible: unlessBlocked });
+@@ -187,6 +190,7 @@ export function createTUIState(options: KimiTUIOptions): TUIState {
      transcriptContainer,
+     transcriptView,
      activityContainer,
 +    agentDockContainer,
-     todoPanelContainer,
-     todoPanel,
      notifyPanelContainer,
+     notifyPanel,
+     queueContainer,
 diff --git a/apps/kimi-code/test/tui/components/chrome/agent-dock.test.ts b/apps/kimi-code/test/tui/components/chrome/agent-dock.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..085152ca361e592562545facca38a7b32a2dae90
@@ -1482,10 +1476,10 @@ index 0000000000000000000000000000000000000000..29f8c8bfd4afb37c78762670226901f1
 +  });
 +});
 diff --git a/apps/kimi-code/test/tui/controllers/subagent-activity-store.test.ts b/apps/kimi-code/test/tui/controllers/subagent-activity-store.test.ts
-index 06b90dd6941759d20b6b44bc08601a89cbaa2894..e4e17fc12b6af4e5a490464b3448473aaf4013f8 100644
+index 6e6ec5ecd7c51e0170c2084250050492e352b26d..c884c15043b6532207d18642753dfff3a5e31256 100644
 --- a/apps/kimi-code/test/tui/controllers/subagent-activity-store.test.ts
 +++ b/apps/kimi-code/test/tui/controllers/subagent-activity-store.test.ts
-@@ -310,4 +310,32 @@ describe('SubagentActivityStore', () => {
+@@ -350,4 +350,32 @@ describe('SubagentActivityStore', () => {
      store.markCompleted('agent-1', 'done');
      expect(buffers.has('agent-1:t-trunc')).toBe(false);
    });
@@ -1518,6 +1512,19 @@ index 06b90dd6941759d20b6b44bc08601a89cbaa2894..e4e17fc12b6af4e5a490464b3448473a
 +    expect(changes).toHaveLength(6);
 +  });
  });
+diff --git a/apps/kimi-code/test/tui/kimi-tui-startup.test.ts b/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
+index afc47b09c5b5e1d347d7df8ab1c80b10d406960d..5f90c0dc2a8611bf64947aff77a12d28820c6043 100644
+--- a/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
++++ b/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
+@@ -494,7 +494,7 @@ describe('KimiTUI startup', () => {
+     await expect(driver.init()).resolves.toBe(false);
+     mountFooter(driver.state);
+ 
+-    expect(driver.state.dockContainer?.children).toHaveLength(7);
++    expect(driver.state.dockContainer?.children).toHaveLength(8);
+     expect(driver.state.activityContainer.render(80).map((line) => line.trim())).toEqual(['']);
+   });
+ 
 -- 
 2.50.1 (Apple Git-155)
 
