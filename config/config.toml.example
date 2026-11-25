@@ -621,7 +621,7 @@ model = "gemini-4-carbon-high"
 display_name = "Gemini 4 Carbon (agy)"
 max_context_size = 1048576
 max_output_size = 262144
-capabilities = [ "tool_use", "image_in", "always_thinking" ]
+capabilities = [ "tool_use", "image_in", "thinking", "always_thinking" ]
 support_efforts = [ "low", "medium", "high" ]
 default_effort = "high"
 
@@ -631,7 +631,7 @@ model = "gemini-4-argon-high"
 display_name = "Gemini 4 Argon (agy)"
 max_context_size = 1048576
 max_output_size = 65536
-capabilities = [ "tool_use", "image_in", "always_thinking" ]
+capabilities = [ "tool_use", "image_in", "thinking", "always_thinking" ]
 support_efforts = [ "low", "medium", "high" ]
 default_effort = "high"
 
@@ -641,8 +641,18 @@ model = "gemini-4-hydrogen-high"
 display_name = "Gemini 4 Hydrogen (agy)"
 max_context_size = 1048576
 max_output_size = 262144
-capabilities = [ "tool_use", "image_in", "always_thinking" ]
-support_efforts = [ "low", "medium", "high" ]
+capabilities = [ "tool_use", "image_in", "thinking", "always_thinking" ]
+support_efforts = [ "low", "medium", "high", "xhigh" ]
+default_effort = "high"
+
+[models."gemini/hydrogen-tiered"]
+provider = "gemini"
+model = "gemini-4-hydrogen-tiered-high"
+display_name = "Gemini 4 Hydrogen Tiered (agy)"
+max_context_size = 1048576
+max_output_size = 262144
+capabilities = [ "tool_use", "image_in", "thinking", "always_thinking" ]
+support_efforts = [ "high", "xhigh" ]
 default_effort = "high"
 
 [models."gemini/neon"]
@@ -651,7 +661,7 @@ model = "gemini-4-neon-high"
 display_name = "Gemini 4 Neon (agy)"
 max_context_size = 1048576
 max_output_size = 262144
-capabilities = [ "tool_use", "image_in", "always_thinking" ]
+capabilities = [ "tool_use", "image_in", "thinking", "always_thinking" ]
 support_efforts = [ "low", "medium", "high", "xhigh" ]
 default_effort = "high"
 
@@ -661,7 +671,7 @@ model = "gemini-3.8-flash-high"
 display_name = "Gemini 3.8 Flash (agy)"
 max_context_size = 1048576
 max_output_size = 65536
-capabilities = [ "tool_use", "image_in", "always_thinking" ]
+capabilities = [ "tool_use", "image_in", "thinking", "always_thinking" ]
 support_efforts = [ "low", "medium", "high" ]
 default_effort = "high"
 
@@ -671,7 +681,7 @@ model = "claude-opus-5-5-high"
 display_name = "Claude Opus 5.5 via agy"
 max_context_size = 1000000
 max_output_size = 128000
-capabilities = [ "tool_use", "image_in", "always_thinking" ]
+capabilities = [ "tool_use", "image_in", "thinking", "always_thinking" ]
 support_efforts = [ "low", "medium", "high" ]
 default_effort = "high"
 
@@ -681,6 +691,104 @@ model = "claude-sonnet-5-5-high"
 display_name = "Claude Sonnet 5.5 via agy"
 max_context_size = 1000000
 max_output_size = 128000
-capabilities = [ "tool_use", "image_in", "always_thinking" ]
+capabilities = [ "tool_use", "image_in", "thinking", "always_thinking" ]
 support_efforts = [ "low", "medium", "high" ]
 default_effort = "high"
+
+[models."gemini/gpt-oss-120b"]
+provider = "gemini"
+model = "gpt-oss-120b-medium"
+display_name = "GPT-OSS 120B (agy)"
+max_context_size = 131072
+max_output_size = 32768
+capabilities = [ "tool_use", "image_in", "thinking", "always_thinking" ]
+support_efforts = [ "medium" ]
+default_effort = "medium"
+
+[models."gemini/gemini-3-flash"]
+provider = "gemini"
+model = "gemini-3-flash"
+display_name = "Gemini 3 Flash (agy)"
+max_context_size = 1048576
+max_output_size = 65536
+capabilities = [ "tool_use", "image_in" ]
+
+[models."gemini/gemini-3.5-flash-lite"]
+provider = "gemini"
+model = "gemini-3.5-flash-lite"
+display_name = "Gemini 3.5 Flash Lite (agy)"
+max_context_size = 1048576
+max_output_size = 65535
+capabilities = [ "tool_use", "image_in" ]
+
+[models."gemini/gemini-3.1-flash-lite"]
+provider = "gemini"
+model = "gemini-3.1-flash-lite"
+display_name = "Gemini 3.1 Flash Lite (agy)"
+max_context_size = 1048576
+max_output_size = 65535
+capabilities = [ "tool_use", "image_in" ]
+
+[models."gemini/gemini-3.1-flash-image"]
+provider = "gemini"
+model = "gemini-3.1-flash-image"
+display_name = "Gemini 3.1 Flash Image (agy)"
+max_context_size = 65536
+max_output_size = 65536
+capabilities = [ "tool_use", "image_in" ]
+
+[models."gemini/gemini-2.5-flash"]
+provider = "gemini"
+model = "gemini-2.5-flash"
+display_name = "Gemini 2.5 Flash (agy)"
+max_context_size = 1048576
+max_output_size = 65535
+capabilities = [ "tool_use", "image_in" ]
+
+[models."gemini/gemini-2.5-flash-lite"]
+provider = "gemini"
+model = "gemini-2.5-flash-lite"
+display_name = "Gemini 2.5 Flash Lite (agy)"
+max_context_size = 1048576
+max_output_size = 65535
+capabilities = [ "tool_use", "image_in" ]
+
+[models."gemini/gemini-2.5-flash-thinking"]
+provider = "gemini"
+model = "gemini-2.5-flash-thinking"
+display_name = "Gemini 2.5 Flash Thinking (agy)"
+max_context_size = 1048576
+max_output_size = 65535
+capabilities = [ "tool_use", "image_in" ]
+
+[models."gemini/orchestrator-carbon"]
+provider = "gemini"
+model = "gemini-pro-orchestrator"
+display_name = "Orchestrator Carbon (agy)"
+max_context_size = 1048576
+max_output_size = 262144
+capabilities = [ "tool_use", "image_in" ]
+
+[models."gemini/orchestrator-argon"]
+provider = "gemini"
+model = "gemini-pro-orchestrator-argon"
+display_name = "Orchestrator Argon (agy)"
+max_context_size = 1048576
+max_output_size = 65536
+capabilities = [ "tool_use", "image_in" ]
+
+[models."gemini/orchestrator-neon"]
+provider = "gemini"
+model = "gemini-pro-orchestrator-neon"
+display_name = "Orchestrator Neon (agy)"
+max_context_size = 1048576
+max_output_size = 262144
+capabilities = [ "tool_use", "image_in" ]
+
+[models."gemini/orchestrator-hydrogen"]
+provider = "gemini"
+model = "gemini-flash-worker-agy"
+display_name = "Gemini 4 Hydrogen Orchestrator (agy)"
+max_context_size = 1048576
+max_output_size = 262144
+capabilities = [ "tool_use", "image_in" ]

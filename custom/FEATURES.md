@@ -394,6 +394,19 @@ Code:
 
 Tests: `packages/agent-core-v2/test/features/geminiFilterRetry/geminiFilterRetry.test.ts` (detection, spintax, a blocked reply, a failed request, both 5-retry caps, a real subagent run through `runAgentTurn`, subagents-only mode, off), `apps/kimi-code/test/tui/commands/gemini-filter-retry-preferences.test.ts`; `loop/stubs.ts`, `toolSelectService.test.ts` and `subagentScopeCache.test.ts` gained `registerLlmRecovery`.
 
+## 17. Gemini forwarder model sync (`0016-…`)
+
+When Kimi starts (and every 6 hours while `kimi web` runs), any configured Gemini forwarder provider is synced against its `GET <base_url>/models` endpoint so Kimi always has every model and effort level the forwarder offers.
+
+- `packages/oauth/src/gemini-forwarder.ts`: `refreshGeminiForwarderModels(host, config, options)`.
+  - **Which providers:** providers whose `api_key_env` is `GEMINI_FORWARDER_KEY`, or `MUSE_FORWARDER_KEY` when the provider id contains `gemini` (case-insensitive), using `openai` or `openai_responses` protocol and a valid `http(s)` `base_url`. Skipped: `model_source = "static"`, registry `source`, `oauth`, and `__kimi_env`. When the configured key env var is unset or blank, the provider is skipped silently (no startup warning for users without a forwarder key).
+  - **Grouping `/v1/models`:** effort-suffixed entries (`-(minimal|low|medium|high|xhigh|max)`) sharing a stem are grouped into one model family (preferring `-high`, then `-medium`, then the highest effort as the canonical `model` id, with sorted `support_efforts`, `default_effort`, and `thinking` + `always_thinking` capabilities). Standalone entries keep their own id with `capabilities = ["tool_use", "image_in"]`. Duplicate display names (such as legacy aliases sharing a display name) are disambiguated with `[<stem>]`, and `-tiered` stems gain `Tiered`.
+  - **Reconciliation:** existing aliases whose `model` matches any member of a family are updated in place (limits and efforts via CloseRouter's `patchAlias()`, respecting `overrides` and `[secondary_model].default_effort` conflicts, and preserving custom alias names and `display_name`). Families not yet configured are added as `<provider>/<stem>`. Existing aliases are never deleted.
+  - **Security & hygiene:** keys with control characters are refused, redirects are rejected (`redirect: 'error'`), timeouts match CloseRouter/OpenRouter (10 s response / 30 s total), and the key is redacted from all error messages. Re-reads config before writing, writes only `models` when something changed, and reports `unchanged` when nothing changed.
+- `packages/oauth/src/refreshProviderModels.ts`: branch 1.7 runs right after OpenRouter for `scope === 'all'`, isolated in its own `try/catch`.
+
+Tests: oauth `test/gemini-forwarder.test.ts` (`geminiForwarderModelsUrl`, `isGeminiForwarderProvider`, `groupGeminiForwarderModels`, `refreshGeminiForwarderModels`, idempotency, unset key skip, `model_source = "static"`, key redaction, `[secondary_model]` conflict, and `refreshProviderModels` integration).
+
 ## When a patch conflicts
 
 `update.sh` stops, leaves the new release in `source.next` with the patch half-applied, and keeps your current `kimi` running.

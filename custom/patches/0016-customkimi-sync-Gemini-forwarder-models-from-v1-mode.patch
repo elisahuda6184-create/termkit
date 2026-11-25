@@ -1,0 +1,1060 @@
+From e4d026ef73b009c78787fc75d4d39bedaa87e553 Mon Sep 17 00:00:00 2001
+From: Admin <admin@Admins-MacBook-Pro.local>
+Date: Thu, 26 Nov 2026 02:33:00 +0700
+Subject: [PATCH 16/16] customkimi: sync Gemini forwarder models from
+ /v1/models
+
+---
+ packages/oauth/src/gemini-forwarder.ts       | 485 +++++++++++++++++++
+ packages/oauth/src/refreshProviderModels.ts  |  38 ++
+ packages/oauth/test/gemini-forwarder.test.ts | 483 ++++++++++++++++++
+ 3 files changed, 1006 insertions(+)
+ create mode 100644 packages/oauth/src/gemini-forwarder.ts
+ create mode 100644 packages/oauth/test/gemini-forwarder.test.ts
+
+diff --git a/packages/oauth/src/gemini-forwarder.ts b/packages/oauth/src/gemini-forwarder.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e7973446f0520d51891aa540ce23a410f189396
+--- /dev/null
++++ b/packages/oauth/src/gemini-forwarder.ts
+@@ -0,0 +1,485 @@
++import type { ManagedKimiConfigShape } from './managed-kimi-code';
++import { readApiErrorMessage } from './api-error';
++import {
++  ENDPOINT_TYPE_BY_PROTOCOL,
++  ENV_OVERLAY_PREFIX,
++  FailureLog,
++  errorMessage,
++  parseEfforts,
++  patchAlias,
++  positiveInteger,
++  readAlias,
++  sameAlias,
++  secondaryModelEffort,
++  subagentEffortProblem,
++  thinkingFields,
++  type AliasMetadata,
++  type CloseRouterEndpointType,
++  type CloseRouterRefreshHost,
++  type SubagentEffort,
++} from './closerouter';
++import { declaredProviderCredential, nonEmptyString } from './provider-credential';
++import { isRecord } from './utils';
++
++export const MUSE_FORWARDER_KEY_ENV = 'MUSE_FORWARDER_KEY';
++export const GEMINI_FORWARDER_KEY_ENV = 'GEMINI_FORWARDER_KEY';
++
++const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
++const DEFAULT_DEADLINE_MS = 30_000;
++
++const EFFORT_SUFFIX = /^(.*?)-(minimal|low|medium|high|xhigh|max)$/;
++const DISPLAY_EFFORT_SUFFIX = /\s*\((?:minimal|low|medium|high|xhigh|max)\)\s*$/i;
++const CONTROL_CHARS = /[\u0000-\u001F\u007F]/;
++
++export interface GeminiForwarderRefreshOptions {
++  readonly providerId?: string;
++  readonly requestTimeoutMs?: number;
++  readonly deadlineMs?: number;
++  readonly fetchImpl?: typeof fetch;
++  readonly env?: Readonly<Record<string, string | undefined>>;
++}
++
++export interface GeminiForwarderProviderChange {
++  readonly providerId: string;
++  readonly added: number;
++  readonly aliases: number;
++  readonly limits: boolean;
++  readonly efforts: boolean;
++}
++
++export interface GeminiForwarderRefreshResult {
++  readonly config: ManagedKimiConfigShape;
++  readonly changed: ReadonlyArray<GeminiForwarderProviderChange>;
++  readonly unchanged: readonly string[];
++  readonly failed: ReadonlyArray<{ readonly provider: string; readonly reason: string }>;
++}
++
++export interface GeminiForwarderModelFamily {
++  readonly stem: string;
++  readonly canonicalModelId: string;
++  readonly memberIds: ReadonlySet<string>;
++  readonly displayName: string;
++  readonly maxContextSize?: number;
++  readonly maxOutputSize?: number;
++  readonly efforts: readonly string[];
++}
++
++interface GeminiForwarderProviderTarget {
++  readonly providerId: string;
++  readonly modelsUrl: string;
++  readonly apiKey: string;
++  readonly endpointType: CloseRouterEndpointType;
++}
++
++interface RawCatalogEntry {
++  readonly id: string;
++  readonly displayName?: string;
++  readonly maxContextSize?: number;
++  readonly maxOutputSize?: number;
++}
++
++export function geminiForwarderModelsUrl(baseUrl: unknown): string | undefined {
++  const value = nonEmptyString(baseUrl);
++  if (value === undefined) return undefined;
++  let url: URL;
++  try {
++    url = new URL(value);
++  } catch {
++    return undefined;
++  }
++  if (url.protocol !== 'https:' && url.protocol !== 'http:') return undefined;
++  if (url.search !== '' || url.hash !== '') return undefined;
++  const pathname = url.pathname.replace(/\/+$/, '');
++  return `${url.origin}${pathname}/models`;
++}
++
++export function isGeminiForwarderProvider(providerId: string, provider: Record<string, unknown>): boolean {
++  const apiKeyEnv = nonEmptyString(provider['apiKeyEnv']);
++  if (apiKeyEnv === GEMINI_FORWARDER_KEY_ENV) return true;
++  return apiKeyEnv === MUSE_FORWARDER_KEY_ENV && providerId.toLowerCase().includes('gemini');
++}
++
++export function groupGeminiForwarderModels(entries: readonly unknown[]): GeminiForwarderModelFamily[] {
++  const buckets = new Map<
++    string,
++    {
++      readonly stem: string;
++      readonly items: Array<{ readonly entry: RawCatalogEntry; readonly effort?: string }>;
++    }
++  >();
++
++  for (const raw of entries) {
++    if (!isRecord(raw)) continue;
++    const id = nonEmptyString(raw['id']);
++    if (id === undefined) continue;
++    const entry: RawCatalogEntry = {
++      id,
++      displayName: nonEmptyString(raw['display_name']),
++      maxContextSize: positiveInteger(raw['max_context']) ?? positiveInteger(raw['context_length']),
++      maxOutputSize:
++        positiveInteger(raw['max_output']) ?? positiveInteger(raw['max_output_tokens']),
++    };
++    const match = EFFORT_SUFFIX.exec(id);
++    const stem = match !== null && match[1]!.length > 0 ? match[1]! : id;
++    const effort = match !== null && match[1]!.length > 0 ? match[2]! : undefined;
++    let bucket = buckets.get(stem);
++    if (bucket === undefined) {
++      bucket = { stem, items: [] };
++      buckets.set(stem, bucket);
++    }
++    if (!bucket.items.some((existing) => existing.entry.id === entry.id)) {
++      bucket.items.push({ entry, effort });
++    }
++  }
++
++  const preliminary = [...buckets.values()].map(({ stem, items }) => {
++    const rawEfforts = items
++      .map((item) => item.effort)
++      .filter((effort): effort is string => effort !== undefined);
++    const efforts = parseEfforts(rawEfforts) ?? [];
++    const byEffort = new Map<string, RawCatalogEntry>();
++    for (const item of items) {
++      if (item.effort !== undefined) byEffort.set(item.effort, item.entry);
++    }
++    const canonicalEntry =
++      byEffort.get('high') ??
++      byEffort.get('medium') ??
++      (efforts.length > 0 ? byEffort.get(efforts[efforts.length - 1]!) : undefined) ??
++      items[0]!.entry;
++    const baseDisplay = formatBaseDisplayName(stem, canonicalEntry.displayName, efforts.length > 0);
++    return {
++      stem,
++      canonicalModelId: canonicalEntry.id,
++      memberIds: new Set(items.map((item) => item.entry.id)),
++      baseDisplay,
++      maxContextSize: canonicalEntry.maxContextSize,
++      maxOutputSize: canonicalEntry.maxOutputSize,
++      efforts,
++    };
++  });
++
++  const displayCounts = new Map<string, number>();
++  for (const family of preliminary) {
++    displayCounts.set(family.baseDisplay, (displayCounts.get(family.baseDisplay) ?? 0) + 1);
++  }
++
++  return preliminary.map(({ baseDisplay, ...rest }) => {
++    const collided = (displayCounts.get(baseDisplay) ?? 0) > 1;
++    const displayName =
++      collided && !stemMatchesDisplay(rest.stem, baseDisplay)
++        ? `${baseDisplay} [${rest.stem}]`
++        : baseDisplay;
++    return {
++      ...rest,
++      displayName: withAgySuffix(displayName),
++    };
++  });
++}
++
++function formatBaseDisplayName(stem: string, rawDisplay: string | undefined, hasEfforts: boolean): string {
++  const cleaned =
++    rawDisplay === undefined
++      ? stem
++      : (hasEfforts ? rawDisplay.replace(DISPLAY_EFFORT_SUFFIX, '') : rawDisplay).trim();
++  const base = cleaned.length > 0 ? cleaned : stem;
++  if (stem.includes('-tiered') && !/\btiered\b/i.test(base)) {
++    return `${base} Tiered`;
++  }
++  return base;
++}
++
++function stemMatchesDisplay(stem: string, display: string): boolean {
++  const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '');
++  return normalize(stem) === normalize(display);
++}
++
++function withAgySuffix(display: string): string {
++  if (/\bagy\b/i.test(display)) return display;
++  return `${display} (agy)`;
++}
++
++export async function refreshGeminiForwarderModels(
++  host: CloseRouterRefreshHost,
++  config: ManagedKimiConfigShape,
++  options: GeminiForwarderRefreshOptions = {},
++): Promise<GeminiForwarderRefreshResult> {
++  const env = options.env ?? process.env;
++  const failures = new FailureLog();
++  const targets = geminiForwarderTargets(config, options.providerId, env, failures);
++  if (targets.length === 0) {
++    return { config, changed: [], unchanged: [], failed: failures.list() };
++  }
++
++  const fetched = new Map<string, GeminiForwarderModelFamily[]>();
++  for (const target of targets) {
++    try {
++      const entries = await fetchCatalog(target.modelsUrl, target.apiKey, host.userAgent, options);
++      if (entries.length === 0) continue;
++      fetched.set(target.providerId, groupGeminiForwarderModels(entries));
++    } catch (error) {
++      failures.add(
++        target.providerId,
++        `Gemini forwarder model catalog request failed (${errorMessage(error)}); keeping the previous models.`,
++      );
++    }
++  }
++
++  if (fetched.size === 0) {
++    return { config, changed: [], unchanged: [], failed: failures.list() };
++  }
++
++  let fresh: ManagedKimiConfigShape;
++  try {
++    fresh = await host.getConfig();
++  } catch (error) {
++    for (const providerId of fetched.keys()) {
++      failures.add(
++        providerId,
++        `Could not re-read the config after the Gemini forwarder request: ${errorMessage(error)}`,
++      );
++    }
++    return { config, changed: [], unchanged: [], failed: failures.list() };
++  }
++
++  const next = structuredClone(fresh);
++  if (!isRecord(next.models)) next.models = {};
++  const subagentEffort = secondaryModelEffort(fresh);
++  const changed = new Map<string, GeminiForwarderProviderChange>();
++  const seen = new Set<string>();
++
++  for (const target of targets) {
++    const families = fetched.get(target.providerId);
++    if (families === undefined) continue;
++    const provider = fresh.providers[target.providerId];
++    if (!isRecord(provider) || provider['modelSource'] === 'static') continue;
++    seen.add(target.providerId);
++
++    const existingEntries = existingProviderAliases(fresh, target.providerId);
++    let added = 0;
++    let updatedAliases = 0;
++    let limitsChanged = false;
++    let effortsChanged = false;
++
++    for (const family of families) {
++      const matching = existingEntries.filter(
++        (entry) => family.memberIds.has(entry.modelId) || entry.modelId === family.stem,
++      );
++
++      if (matching.length > 0) {
++        const metadata: AliasMetadata = {
++          maxContextSize: family.maxContextSize,
++          maxOutputSize: family.maxOutputSize,
++          efforts: family.efforts.length > 0 ? family.efforts : undefined,
++        };
++        for (const match of matching) {
++          const current = readAlias(fresh, match.alias);
++          let patched = patchAlias(current, target.endpointType, metadata);
++          const conflict = subagentEffortConflict(subagentEffort, match.alias, current, patched);
++          if (conflict !== undefined) {
++            failures.add(target.providerId, conflict);
++            patched = patchAlias(current, target.endpointType, { ...metadata, efforts: undefined });
++          }
++          if (!sameAlias(current, patched)) {
++            next.models[match.alias] = patched as never;
++            updatedAliases += 1;
++            if (
++              current['maxContextSize'] !== patched['maxContextSize'] ||
++              current['maxOutputSize'] !== patched['maxOutputSize']
++            ) {
++              limitsChanged = true;
++            }
++            if (JSON.stringify(thinkingFields(current)) !== JSON.stringify(thinkingFields(patched))) {
++              effortsChanged = true;
++            }
++          }
++        }
++        continue;
++      }
++
++      const alias = `${target.providerId}/${family.stem}`;
++      if (alias in next.models) continue;
++      next.models[alias] = buildAlias(target.providerId, family) as never;
++      added += 1;
++    }
++
++    if (added > 0 || updatedAliases > 0) {
++      changed.set(target.providerId, {
++        providerId: target.providerId,
++        added,
++        aliases: updatedAliases,
++        limits: limitsChanged,
++        efforts: effortsChanged,
++      });
++    }
++  }
++
++  const failed = failures.list();
++  const unchanged = [...seen].filter(
++    (providerId) =>
++      !changed.has(providerId) && !failed.some((failure) => failure.provider === providerId),
++  );
++  if (changed.size === 0) return { config: fresh, changed: [], unchanged, failed };
++
++  try {
++    const written = await host.setConfig({ models: next.models } as ManagedKimiConfigShape);
++    return { config: written, changed: [...changed.values()], unchanged, failed };
++  } catch (error) {
++    for (const providerId of changed.keys()) {
++      failures.add(
++        providerId,
++        `Could not save the refreshed Gemini forwarder models: ${errorMessage(error)}`,
++      );
++    }
++    return { config: fresh, changed: [], unchanged, failed: failures.list() };
++  }
++}
++
++function geminiForwarderTargets(
++  config: ManagedKimiConfigShape,
++  providerIdFilter: string | undefined,
++  env: Readonly<Record<string, string | undefined>>,
++  failures: FailureLog,
++): GeminiForwarderProviderTarget[] {
++  const targets: GeminiForwarderProviderTarget[] = [];
++  for (const [providerId, provider] of Object.entries(config.providers)) {
++    if (providerId.startsWith(ENV_OVERLAY_PREFIX)) continue;
++    if (providerIdFilter !== undefined && providerId !== providerIdFilter) continue;
++    if (!isRecord(provider)) continue;
++    if (provider['modelSource'] === 'static') continue;
++    if (provider['source'] !== undefined || provider['oauth'] !== undefined) continue;
++    if (!isGeminiForwarderProvider(providerId, provider)) continue;
++    const protocol = nonEmptyString(provider['type']) ?? 'openai_responses';
++    const endpointType = ENDPOINT_TYPE_BY_PROTOCOL[protocol];
++    if (endpointType === undefined || endpointType === 'messages') continue;
++    const modelsUrl = geminiForwarderModelsUrl(provider['baseUrl']);
++    if (modelsUrl === undefined) continue;
++    const declared = declaredProviderCredential(provider, providerId);
++    if (declared.kind === 'conflict') {
++      failures.add(providerId, declared.message);
++      continue;
++    }
++    let apiKey: string | undefined;
++    if (declared.kind === 'inline') {
++      apiKey = declared.apiKey;
++    } else if (declared.kind === 'env') {
++      apiKey = nonEmptyString(env[declared.apiKeyEnv]);
++    }
++    if (apiKey === undefined) continue;
++    targets.push({ providerId, modelsUrl, apiKey, endpointType });
++  }
++  return targets;
++}
++
++function existingProviderAliases(
++  config: ManagedKimiConfigShape,
++  providerId: string,
++): Array<{ readonly alias: string; readonly modelId: string }> {
++  const list: Array<{ readonly alias: string; readonly modelId: string }> = [];
++  for (const [alias, model] of Object.entries(config.models ?? {})) {
++    if (!isRecord(model) || alias.startsWith(ENV_OVERLAY_PREFIX)) continue;
++    if (nonEmptyString(model['provider']) !== providerId) continue;
++    if (model['oauth'] !== undefined) continue;
++    const modelId = nonEmptyString(model['name']) ?? nonEmptyString(model['model']);
++    if (modelId === undefined) continue;
++    list.push({ alias, modelId });
++  }
++  return list;
++}
++
++function buildAlias(
++  providerId: string,
++  family: GeminiForwarderModelFamily,
++): Record<string, unknown> {
++  const alias: Record<string, unknown> = {
++    provider: providerId,
++    model: family.canonicalModelId,
++    displayName: family.displayName,
++  };
++  if (family.maxContextSize !== undefined) alias['maxContextSize'] = family.maxContextSize;
++  if (family.maxOutputSize !== undefined) alias['maxOutputSize'] = family.maxOutputSize;
++  if (family.efforts.length > 0) {
++    alias['capabilities'] = ['tool_use', 'image_in', 'thinking', 'always_thinking'];
++    alias['supportEfforts'] = [...family.efforts];
++    alias['defaultEffort'] = family.efforts.includes('high')
++      ? 'high'
++      : family.efforts[Math.floor(family.efforts.length / 2)];
++  } else {
++    alias['capabilities'] = ['tool_use', 'image_in'];
++  }
++  return alias;
++}
++
++function subagentEffortConflict(
++  subagent: SubagentEffort | undefined,
++  alias: string,
++  current: Record<string, unknown>,
++  patched: Record<string, unknown>,
++): string | undefined {
++  if (subagent === undefined || !subagent.aliases.has(alias)) return undefined;
++  if (JSON.stringify(thinkingFields(current)) === JSON.stringify(thinkingFields(patched))) {
++    return undefined;
++  }
++  const problem = subagentEffortProblem(subagent.effort, patched);
++  if (problem === undefined) return undefined;
++  return `[secondary_model] default_effort "${subagent.effort}" would no longer work with ${alias}: ${problem}. Change default_effort to apply Gemini forwarder's efforts; keeping its previous efforts.`;
++}
++
++async function fetchCatalog(
++  modelsUrl: string,
++  apiKey: string,
++  userAgent: string | undefined,
++  options: GeminiForwarderRefreshOptions,
++): Promise<readonly unknown[]> {
++  if (CONTROL_CHARS.test(apiKey)) {
++    throw new Error('the API key contains control characters (such as a line break)');
++  }
++  const headers: Record<string, string> = {
++    Accept: 'application/json',
++    Authorization: `Bearer ${apiKey}`,
++  };
++  if (userAgent !== undefined) headers['User-Agent'] = userAgent;
++  const fetchImpl = options.fetchImpl ?? fetch;
++  const responseTimeout = new AbortController();
++  const timer = setTimeout(() => {
++    responseTimeout.abort(new DOMException('The catalog request timed out.', 'TimeoutError'));
++  }, options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
++  let response: Response;
++  try {
++    response = await fetchImpl(modelsUrl, {
++      headers,
++      redirect: 'error',
++      signal: AbortSignal.any([
++        AbortSignal.timeout(options.deadlineMs ?? DEFAULT_DEADLINE_MS),
++        responseTimeout.signal,
++      ]),
++    });
++  } catch (error) {
++    // oxlint-disable-next-line preserve-caught-error -- the cause can carry the API key; its text is kept, redacted
++    throw new Error(withoutKey(errorMessage(error), apiKey));
++  } finally {
++    clearTimeout(timer);
++  }
++  if (!response.ok) {
++    throw new Error(withoutKey(await readApiErrorMessage(response, `HTTP ${response.status}`), apiKey));
++  }
++  let text: string;
++  try {
++    text = await response.text();
++  } catch (error) {
++    // oxlint-disable-next-line preserve-caught-error -- the cause can carry the API key; its text is kept, redacted
++    throw new Error(withoutKey(errorMessage(error), apiKey));
++  }
++  let body: unknown;
++  try {
++    body = JSON.parse(text) as unknown;
++  } catch {
++    throw new Error('the response is not valid JSON');
++  }
++  const entries = isRecord(body) && Array.isArray(body['data']) ? body['data'] : undefined;
++  if (entries === undefined) throw new Error('the response has no data list');
++  return entries;
++}
++
++function withoutKey(message: string, apiKey: string): string {
++  return message.split(apiKey).join('[redacted]');
++}
+diff --git a/packages/oauth/src/refreshProviderModels.ts b/packages/oauth/src/refreshProviderModels.ts
+index abacd5c19baa1d211c452436db1849db699e666f..e72e0db4bad04be990f023f92b45fe0c9a027a05 100644
+--- a/packages/oauth/src/refreshProviderModels.ts
++++ b/packages/oauth/src/refreshProviderModels.ts
+@@ -10,6 +10,10 @@ import {
+   reservedProviderIdMessage,
+   type CustomRegistrySource,
+ } from './custom-registry';
++import {
++  refreshGeminiForwarderModels,
++  type GeminiForwarderProviderChange,
++} from './gemini-forwarder';
+ import {
+   applyManagedApiKeyProviderModels,
+   applyManagedKimiCodeConfig,
+@@ -392,6 +396,27 @@ function metadataChange(
+   };
+ }
+ 
++function geminiForwarderChange({
++  providerId,
++  added,
++  aliases,
++  limits,
++  efforts,
++}: GeminiForwarderProviderChange): ProviderChange {
++  const what = limits && efforts ? 'limits and efforts' : efforts ? 'efforts' : 'limits';
++  return {
++    providerId,
++    providerName: providerId,
++    added,
++    removed: 0,
++    ...(aliases > 0
++      ? {
++          detail: `${what} of ${String(aliases)} model${aliases === 1 ? '' : 's'} updated from Gemini forwarder`,
++        }
++      : {}),
++  };
++}
++
+ export async function refreshProviderModels(
+   host: RefreshProviderHost,
+   options: RefreshProviderOptions = {},
+@@ -511,6 +536,19 @@ export async function refreshProviderModels(
+     });
+   }
+ 
++  try {
++    const gemini = await refreshGeminiForwarderModels(host, config, { providerId: targetId });
++    config = gemini.config;
++    changed.push(...gemini.changed.map(geminiForwarderChange));
++    unchanged.push(...gemini.unchanged);
++    failed.push(...gemini.failed);
++  } catch (error) {
++    failed.push({
++      provider: targetId ?? 'gemini',
++      reason: error instanceof Error ? error.message : String(error),
++    });
++  }
++
+   const openPlatformIds = Object.keys(config.providers).filter((id) => {
+     if (!isOpenPlatformId(id)) return false;
+     const provider = readProvider(config, id);
+diff --git a/packages/oauth/test/gemini-forwarder.test.ts b/packages/oauth/test/gemini-forwarder.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0619f6eb1d4eca27ae07c015d3931ac5cf201ddc
+--- /dev/null
++++ b/packages/oauth/test/gemini-forwarder.test.ts
+@@ -0,0 +1,483 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import {
++  GEMINI_FORWARDER_KEY_ENV,
++  MUSE_FORWARDER_KEY_ENV,
++  geminiForwarderModelsUrl,
++  groupGeminiForwarderModels,
++  isGeminiForwarderProvider,
++  refreshGeminiForwarderModels,
++  type GeminiForwarderRefreshOptions,
++} from '../src/gemini-forwarder';
++import type { ManagedKimiConfigShape } from '../src/managed-kimi-code';
++import { refreshProviderModels, type RefreshProviderHost } from '../src/refreshProviderModels';
++
++const geminiFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
++
++vi.mock('../src/gemini-forwarder', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('../src/gemini-forwarder')>();
++  return {
++    ...actual,
++    refreshGeminiForwarderModels: async (
++      ...args: Parameters<typeof actual.refreshGeminiForwarderModels>
++    ) => {
++      if (geminiFault.error !== undefined) throw geminiFault.error;
++      return actual.refreshGeminiForwarderModels(...args);
++    },
++  };
++});
++
++const FORWARDER_BASE = 'https://forwarder.example.test:8790/v1';
++const MODELS_URL = `${FORWARDER_BASE}/models`;
++const KEY = 'test-forwarder-key-secret';
++
++const SAMPLE_CATALOG = [
++  {
++    id: 'gemini-4-hydrogen-low',
++    display_name: 'Gemini 4 Hydrogen (Low)',
++    max_context: 1048576,
++    max_output: 262144,
++  },
++  {
++    id: 'gemini-4-hydrogen-medium',
++    display_name: 'Gemini 4 Hydrogen (Medium)',
++    max_context: 1048576,
++    max_output: 262144,
++  },
++  {
++    id: 'gemini-4-hydrogen-high',
++    display_name: 'Gemini 4 Hydrogen (High)',
++    max_context: 1048576,
++    max_output: 262144,
++  },
++  {
++    id: 'gemini-4-hydrogen-xhigh',
++    display_name: 'Gemini 4 Hydrogen (XHigh)',
++    max_context: 1048576,
++    max_output: 262144,
++  },
++  {
++    id: 'gemini-4-hydrogen-tiered-high',
++    display_name: 'Gemini 4 Hydrogen (High)',
++    max_context: 1048576,
++    max_output: 262144,
++  },
++  {
++    id: 'gemini-4-hydrogen-tiered-xhigh',
++    display_name: 'Gemini 4 Hydrogen (XHigh)',
++    max_context: 1048576,
++    max_output: 262144,
++  },
++  {
++    id: 'gemini-3-flash',
++    display_name: 'Gemini 3 Flash',
++    max_context: 1048576,
++    max_output: 65536,
++  },
++  {
++    id: 'gemini-3.5-flash-lite',
++    display_name: 'Gemini 3.5 Flash Lite',
++    max_context: 1048576,
++    max_output: 65535,
++  },
++  {
++    id: 'gemini-2.5-flash',
++    display_name: 'Gemini 3.5 Flash Lite',
++    max_context: 1048576,
++    max_output: 65535,
++  },
++  {
++    id: 'gpt-oss-120b-medium',
++    display_name: 'GPT-OSS 120B (Medium)',
++    max_context: 131072,
++    max_output: 32768,
++  },
++  {
++    id: 'gemini-pro-orchestrator',
++    display_name: 'Orchestrator (Carbon)',
++    max_context: 1048576,
++    max_output: 262144,
++  },
++];
++
++interface Call {
++  readonly url: string;
++  readonly init: RequestInit;
++}
++
++function recordingFetch(
++  respond: () => Response | Promise<Response> = () => Response.json({ data: SAMPLE_CATALOG }),
++): { readonly calls: Call[]; readonly fetchImpl: typeof fetch } {
++  const calls: Call[] = [];
++  const fetchImpl = (async (url: string, init: RequestInit) => {
++    calls.push({ url, init });
++    return respond();
++  }) as typeof fetch;
++  return { calls, fetchImpl };
++}
++
++function makeHost(initial: ManagedKimiConfigShape): {
++  readonly host: RefreshProviderHost;
++  readonly current: () => ManagedKimiConfigShape;
++  readonly setConfig: ReturnType<
++    typeof vi.fn<(patch: ManagedKimiConfigShape) => Promise<ManagedKimiConfigShape>>
++  >;
++} {
++  let state = structuredClone(initial);
++  const setConfig = vi.fn(async (patch: ManagedKimiConfigShape) => {
++    state = { ...state, ...patch };
++    return structuredClone(state);
++  });
++  return {
++    host: {
++      getConfig: async () => structuredClone(state),
++      removeProvider: vi.fn(async () => structuredClone(state)),
++      setConfig,
++      resolveOAuthToken: vi.fn(async () => ''),
++      userAgent: 'customkimi-test/1.0',
++    },
++    current: () => structuredClone(state),
++    setConfig,
++  };
++}
++
++function baseConfig(models: Record<string, unknown> = {}): ManagedKimiConfigShape {
++  return {
++    providers: {
++      gemini: {
++        type: 'openai_responses',
++        baseUrl: FORWARDER_BASE,
++        apiKeyEnv: MUSE_FORWARDER_KEY_ENV,
++      },
++      muse: {
++        type: 'openai_responses',
++        baseUrl: 'https://muse.example.test:8788/v1',
++        apiKeyEnv: MUSE_FORWARDER_KEY_ENV,
++      },
++    },
++    models,
++  } as unknown as ManagedKimiConfigShape;
++}
++
++afterEach(() => {
++  geminiFault.error = undefined;
++  vi.unstubAllEnvs();
++  vi.unstubAllGlobals();
++});
++
++describe('geminiForwarderModelsUrl', () => {
++  it('normalizes trailing slashes and rejects invalid URLs', () => {
++    expect(geminiForwarderModelsUrl('https://forwarder.example.test:8790/v1')).toBe(
++      'https://forwarder.example.test:8790/v1/models',
++    );
++    expect(geminiForwarderModelsUrl('https://forwarder.example.test:8790/v1/')).toBe(
++      'https://forwarder.example.test:8790/v1/models',
++    );
++    expect(geminiForwarderModelsUrl('http://127.0.0.1:8790/v1')).toBe(
++      'http://127.0.0.1:8790/v1/models',
++    );
++    expect(geminiForwarderModelsUrl('https://forwarder.example.test:8790/v1?x=1')).toBeUndefined();
++    expect(geminiForwarderModelsUrl('ftp://forwarder.example.test/v1')).toBeUndefined();
++    expect(geminiForwarderModelsUrl('not-a-url')).toBeUndefined();
++  });
++});
++
++describe('isGeminiForwarderProvider', () => {
++  it('matches GEMINI_FORWARDER_KEY on any provider and MUSE_FORWARDER_KEY on gemini providers', () => {
++    expect(isGeminiForwarderProvider('gemini', { apiKeyEnv: MUSE_FORWARDER_KEY_ENV })).toBe(true);
++    expect(isGeminiForwarderProvider('my-gemini', { apiKeyEnv: MUSE_FORWARDER_KEY_ENV })).toBe(true);
++    expect(isGeminiForwarderProvider('custom', { apiKeyEnv: GEMINI_FORWARDER_KEY_ENV })).toBe(true);
++    expect(isGeminiForwarderProvider('muse', { apiKeyEnv: MUSE_FORWARDER_KEY_ENV })).toBe(false);
++    expect(isGeminiForwarderProvider('gemini', { apiKeyEnv: 'OPENAI_API_KEY' })).toBe(false);
++  });
++});
++
++describe('groupGeminiForwarderModels', () => {
++  it('groups effort variants into families, preserves standalone models, and disambiguates duplicate names', () => {
++    const families = groupGeminiForwarderModels(SAMPLE_CATALOG);
++    const byStem = new Map(families.map((family) => [family.stem, family]));
++
++    expect(byStem.get('gemini-4-hydrogen')).toEqual({
++      stem: 'gemini-4-hydrogen',
++      canonicalModelId: 'gemini-4-hydrogen-high',
++      memberIds: new Set([
++        'gemini-4-hydrogen-low',
++        'gemini-4-hydrogen-medium',
++        'gemini-4-hydrogen-high',
++        'gemini-4-hydrogen-xhigh',
++      ]),
++      displayName: 'Gemini 4 Hydrogen (agy)',
++      maxContextSize: 1048576,
++      maxOutputSize: 262144,
++      efforts: ['low', 'medium', 'high', 'xhigh'],
++    });
++
++    expect(byStem.get('gemini-4-hydrogen-tiered')).toEqual({
++      stem: 'gemini-4-hydrogen-tiered',
++      canonicalModelId: 'gemini-4-hydrogen-tiered-high',
++      memberIds: new Set(['gemini-4-hydrogen-tiered-high', 'gemini-4-hydrogen-tiered-xhigh']),
++      displayName: 'Gemini 4 Hydrogen Tiered (agy)',
++      maxContextSize: 1048576,
++      maxOutputSize: 262144,
++      efforts: ['high', 'xhigh'],
++    });
++
++    expect(byStem.get('gpt-oss-120b')).toEqual({
++      stem: 'gpt-oss-120b',
++      canonicalModelId: 'gpt-oss-120b-medium',
++      memberIds: new Set(['gpt-oss-120b-medium']),
++      displayName: 'GPT-OSS 120B (agy)',
++      maxContextSize: 131072,
++      maxOutputSize: 32768,
++      efforts: ['medium'],
++    });
++
++    expect(byStem.get('gemini-3-flash')).toEqual({
++      stem: 'gemini-3-flash',
++      canonicalModelId: 'gemini-3-flash',
++      memberIds: new Set(['gemini-3-flash']),
++      displayName: 'Gemini 3 Flash (agy)',
++      maxContextSize: 1048576,
++      maxOutputSize: 65536,
++      efforts: [],
++    });
++
++    expect(byStem.get('gemini-3.5-flash-lite')?.displayName).toBe('Gemini 3.5 Flash Lite (agy)');
++    expect(byStem.get('gemini-2.5-flash')?.displayName).toBe(
++      'Gemini 3.5 Flash Lite [gemini-2.5-flash] (agy)',
++    );
++  });
++});
++
++describe('refreshGeminiForwarderModels', () => {
++  it('updates existing aliases in place and adds missing model families without duplicating', async () => {
++    const initial = baseConfig({
++      'gemini/hydrogen': {
++        provider: 'gemini',
++        model: 'gemini-4-hydrogen-high',
++        displayName: 'Gemini 4 Hydrogen (agy)',
++        maxContextSize: 500000,
++        maxOutputSize: 65536,
++        capabilities: ['tool_use', 'image_in', 'always_thinking'],
++        supportEfforts: ['low', 'medium', 'high'],
++        defaultEffort: 'high',
++        overrides: { maxOutputSize: 32768 },
++      },
++    });
++    const { host, current, setConfig } = makeHost(initial);
++    const { calls, fetchImpl } = recordingFetch();
++    const options: GeminiForwarderRefreshOptions = {
++      fetchImpl,
++      env: { [MUSE_FORWARDER_KEY_ENV]: KEY },
++    };
++
++    const result = await refreshGeminiForwarderModels(host, initial, options);
++
++    expect(calls).toHaveLength(1);
++    expect(calls[0]?.url).toBe(MODELS_URL);
++    expect((calls[0]?.init.headers as Record<string, string>)['Authorization']).toBe(`Bearer ${KEY}`);
++    expect(calls[0]?.init.redirect).toBe('error');
++
++    expect(result.failed).toEqual([]);
++    expect(result.unchanged).toEqual([]);
++    expect(result.changed).toEqual([
++      {
++        providerId: 'gemini',
++        added: 6,
++        aliases: 1,
++        limits: true,
++        efforts: true,
++      },
++    ]);
++    expect(setConfig).toHaveBeenCalledTimes(1);
++
++    const models = current().models as Record<string, Record<string, unknown>>;
++    expect(models['gemini/gemini-4-hydrogen']).toBeUndefined();
++    expect(models['gemini/hydrogen']).toEqual({
++      provider: 'gemini',
++      model: 'gemini-4-hydrogen-high',
++      displayName: 'Gemini 4 Hydrogen (agy)',
++      maxContextSize: 1048576,
++      maxOutputSize: 262144,
++      capabilities: ['tool_use', 'image_in', 'thinking', 'always_thinking'],
++      supportEfforts: ['low', 'medium', 'high', 'xhigh'],
++      defaultEffort: 'high',
++      overrides: { maxOutputSize: 32768 },
++    });
++    expect(models['gemini/gemini-4-hydrogen-tiered']).toEqual({
++      provider: 'gemini',
++      model: 'gemini-4-hydrogen-tiered-high',
++      displayName: 'Gemini 4 Hydrogen Tiered (agy)',
++      maxContextSize: 1048576,
++      maxOutputSize: 262144,
++      capabilities: ['tool_use', 'image_in', 'thinking', 'always_thinking'],
++      supportEfforts: ['high', 'xhigh'],
++      defaultEffort: 'high',
++    });
++    expect(models['gemini/gemini-3-flash']).toEqual({
++      provider: 'gemini',
++      model: 'gemini-3-flash',
++      displayName: 'Gemini 3 Flash (agy)',
++      maxContextSize: 1048576,
++      maxOutputSize: 65536,
++      capabilities: ['tool_use', 'image_in'],
++    });
++    expect(models['gemini/gpt-oss-120b']).toEqual({
++      provider: 'gemini',
++      model: 'gpt-oss-120b-medium',
++      displayName: 'GPT-OSS 120B (agy)',
++      maxContextSize: 131072,
++      maxOutputSize: 32768,
++      capabilities: ['tool_use', 'image_in', 'thinking', 'always_thinking'],
++      supportEfforts: ['medium'],
++      defaultEffort: 'medium',
++    });
++
++    const second = await refreshGeminiForwarderModels(host, current(), options);
++    expect(second.failed).toEqual([]);
++    expect(second.changed).toEqual([]);
++    expect(second.unchanged).toEqual(['gemini']);
++    expect(setConfig).toHaveBeenCalledTimes(1);
++  });
++
++  it('skips silently when the forwarder API key env variable is unset', async () => {
++    const initial = baseConfig();
++    const { host, setConfig } = makeHost(initial);
++    const { calls, fetchImpl } = recordingFetch();
++
++    const result = await refreshGeminiForwarderModels(host, initial, {
++      fetchImpl,
++      env: {},
++    });
++
++    expect(result.changed).toEqual([]);
++    expect(result.unchanged).toEqual([]);
++    expect(result.failed).toEqual([]);
++    expect(calls).toHaveLength(0);
++    expect(setConfig).not.toHaveBeenCalled();
++  });
++
++  it('skips providers with model_source static', async () => {
++    const initial = baseConfig();
++    (initial.providers['gemini'] as Record<string, unknown>)['modelSource'] = 'static';
++    const { host, setConfig } = makeHost(initial);
++    const { calls, fetchImpl } = recordingFetch();
++
++    const result = await refreshGeminiForwarderModels(host, initial, {
++      fetchImpl,
++      env: { [MUSE_FORWARDER_KEY_ENV]: KEY },
++    });
++
++    expect(result.changed).toEqual([]);
++    expect(result.unchanged).toEqual([]);
++    expect(result.failed).toEqual([]);
++    expect(calls).toHaveLength(0);
++    expect(setConfig).not.toHaveBeenCalled();
++  });
++
++  it('redacts the API key from error messages and refuses control characters', async () => {
++    const initial = baseConfig();
++    const { host } = makeHost(initial);
++
++    const httpError = await refreshGeminiForwarderModels(host, initial, {
++      fetchImpl: (async () =>
++        new Response(JSON.stringify({ error: { message: `bad token ${KEY}` } }), {
++          status: 401,
++          headers: { 'Content-Type': 'application/json' },
++        })) as typeof fetch,
++      env: { [MUSE_FORWARDER_KEY_ENV]: KEY },
++    });
++    expect(httpError.failed).toHaveLength(1);
++    expect(httpError.failed[0]?.provider).toBe('gemini');
++    expect(httpError.failed[0]?.reason).not.toContain(KEY);
++    expect(httpError.failed[0]?.reason).toContain('[redacted]');
++
++    const badKey = await refreshGeminiForwarderModels(host, initial, {
++      fetchImpl: vi.fn() as unknown as typeof fetch,
++      env: { [MUSE_FORWARDER_KEY_ENV]: 'bad\nkey' },
++    });
++    expect(badKey.failed).toHaveLength(1);
++    expect(badKey.failed[0]?.reason).toContain('control characters');
++  });
++
++  it('keeps previous efforts on a [secondary_model].default_effort conflict while still updating limits', async () => {
++    const initial = {
++      ...baseConfig({
++        'gemini/hydrogen': {
++          provider: 'gemini',
++          model: 'gemini-4-hydrogen-high',
++          displayName: 'Gemini 4 Hydrogen (agy)',
++          maxContextSize: 500000,
++          maxOutputSize: 65536,
++          capabilities: ['tool_use', 'image_in'],
++        },
++      }),
++      secondaryModel: {
++        defaultEffort: 'off',
++        models: { 'gemini/hydrogen': {} },
++      },
++    } as unknown as ManagedKimiConfigShape;
++    const { host, current } = makeHost(initial);
++    const { fetchImpl } = recordingFetch(() =>
++      Response.json({
++        data: [
++          {
++            id: 'gemini-4-hydrogen-high',
++            display_name: 'Gemini 4 Hydrogen (High)',
++            max_context: 1048576,
++            max_output: 262144,
++          },
++        ],
++      }),
++    );
++
++    const result = await refreshGeminiForwarderModels(host, initial, {
++      fetchImpl,
++      env: { [MUSE_FORWARDER_KEY_ENV]: KEY },
++    });
++
++    expect(result.failed).toHaveLength(1);
++    expect(result.failed[0]?.reason).toContain('[secondary_model]');
++    const alias = (current().models as Record<string, Record<string, unknown>>)['gemini/hydrogen'];
++    expect(alias?.['maxContextSize']).toBe(1048576);
++    expect(alias?.['maxOutputSize']).toBe(262144);
++    expect(alias?.['supportEfforts']).toBeUndefined();
++  });
++
++  it('runs during refreshProviderModels(scope=all), skips scope=oauth, and isolates throws', async () => {
++    vi.stubEnv(GEMINI_FORWARDER_KEY_ENV, KEY);
++    const initial: ManagedKimiConfigShape = {
++      providers: {
++        gemini: {
++          type: 'openai_responses',
++          baseUrl: FORWARDER_BASE,
++          apiKeyEnv: GEMINI_FORWARDER_KEY_ENV,
++        },
++      },
++      models: {},
++    } as unknown as ManagedKimiConfigShape;
++    const { host, current } = makeHost(initial);
++    const { calls, fetchImpl } = recordingFetch();
++    vi.stubGlobal('fetch', fetchImpl);
++
++    const oauthOnly = await refreshProviderModels(host, { scope: 'oauth' });
++    expect(oauthOnly.changed).toEqual([]);
++    expect(calls).toHaveLength(0);
++
++    const allResult = await refreshProviderModels(host, { scope: 'all' });
++    expect(allResult.failed).toEqual([]);
++    expect(allResult.changed).toEqual([
++      {
++        providerId: 'gemini',
++        providerName: 'gemini',
++        added: 7,
++        removed: 0,
++      },
++    ]);
++    expect(Object.keys(current().models ?? {})).toHaveLength(7);
++
++    geminiFault.error = new Error('boom');
++    const faultResult = await refreshProviderModels(host, { scope: 'all' });
++    expect(faultResult.failed).toEqual([{ provider: 'gemini', reason: 'boom' }]);
++  });
++});
+-- 
+2.50.1 (Apple Git-155)
+
